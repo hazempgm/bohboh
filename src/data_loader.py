@@ -143,21 +143,15 @@ def load_projections(cfg: object) -> Optional[np.ndarray]:
     # Stack into a 3D array (projections, height, width)
 
 
+    import dask.array as da
 
+    chunk_shape = 'auto' # or e.g., (1000, 1000) or (500, 500)
+    dask_projections = [da.from_array(p, chunks=chunk_shape) for p in projections]
 
-    N = len(projections)
-    H, W = projections[0].shape
-
-    # Preallocate a float32 array to hold results
-    projections_stack = np.empty((N, H, W), dtype=np.float32)
-
-    # Convert each projection and drop the original
-    for i in range(N):
-        projections_stack[i] = projections[i].astype(np.float32)
-        projections[i] = None  # Free memory
-
-    projections = projections_stack
-
+    # 2. Stack the list of Dask arrays along the first axis (axis=0).
+    #    - This creates a new *lazy* Dask array representing the stacked result.
+    #    - No significant computation or memory allocation happens yet.
+    projections_stack = da.stack(dask_projections, axis=0)
 
 
     log.info(f"Successfully loaded {projections_stack.shape[0]} projections.")

@@ -77,8 +77,8 @@ CENTER_OF_ROTATION_OFFSET_PX = -4.0 # Example: Try applying the suggested shift
 
 # --- 4. Preprocessing Parameters ---
 # !! MUST BE ADJUSTED !! Enable if flat/dark files exist and paths/names are correct
-PERFORM_FLAT_FIELD_CORRECTION = True # Set based on availability
-PERFORM_DARK_FIELD_CORRECTION = True # Set based on availability
+PERFORM_FLAT_FIELD_CORRECTION = False # Set based on availability
+PERFORM_DARK_FIELD_CORRECTION = False # Set based on availability
 PERFORM_LOG_CONVERSION = True # Usually True for raw detector data
 
 FLAT_FIELD_MODE = 'average'
