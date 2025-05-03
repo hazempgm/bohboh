@@ -96,7 +96,7 @@ ITERATIVE_RELAXATION_PARAM = 0.1
 RECON_VOXEL_SIZE_MM = DETECTOR_PIXEL_SIZE_MM # Match detector by default
 # Adjust output shape based on expected size/resolution
 RECON_VOLUME_SHAPE = (512, 512, 512) # Example: Smaller output volume (Z, Y, X)
-USE_GPU = False
+USE_GPU = True
 
 
 
