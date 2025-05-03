@@ -98,6 +98,15 @@ RECON_VOXEL_SIZE_MM = DETECTOR_PIXEL_SIZE_MM # Match detector by default
 RECON_VOLUME_SHAPE = (512, 512, 512) # Example: Smaller output volume (Z, Y, X)
 USE_GPU = True
 
+
+
+# --- !! NEW: Memory Optimization !! ---
+# Process the reconstruction volume in chunks along the Z-axis
+# Smaller chunks use less memory per step but might have more overhead.
+# Set to None or 0 to disable chunking.
+RECON_Z_CHUNK_SIZE = 64 # Example: Reconstruct 64 slices at a time
+
+
 # --- 6. Postprocessing Parameters ---
 PERFORM_POST_FILTERING = False
 PERFORM_INTENSITY_SCALING = True
