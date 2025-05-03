@@ -93,7 +93,6 @@ def get_astra_geometry(cfg: object) -> Optional[Tuple[dict, dict]]:
         log.info("ASTRA projection geometry created successfully.")
 
         # --- Create Volume Geometry (For the *full* target volume shape) ---
-        # Chunking logic will create smaller geometries based on this later
         try:
              vol_shape_x = int(cfg.RECON_VOLUME_SHAPE[2])
              vol_shape_y = int(cfg.RECON_VOLUME_SHAPE[1])
@@ -135,7 +134,6 @@ def get_astra_geometry(cfg: object) -> Optional[Tuple[dict, dict]]:
 # reconstruct_fbp_skimage remains the same
 def reconstruct_fbp_skimage(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]:
     """ FBP reconstruction using scikit-image (slice-by-slice). """
-    # ... (implementation from previous version) ...
     if not SKIMAGE_AVAILABLE: return None
     if cfg.GEOMETRY_TYPE != 'parallel': log.warning("Using skimage FBP for non-parallel beam!")
     num_proj, height, width = sinogram.shape
@@ -162,14 +160,7 @@ def reconstruct_astra(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]
     """
     Reconstructs using ASTRA Toolbox algorithms (FDK, SIRT, SART, CGLS).
     Includes Z-axis chunking for memory optimization.
-
-    Args:
-        sinogram: 3D preprocessed attenuation data (n_proj, height, width).
-                  Expected to be a standard NumPy array.
-        cfg: The configuration object.
-
-    Returns:
-        Reconstructed 3D volume (Z, Y, X) or None on error.
+    (Added checks for CPU algorithm name).
     """
     if not ASTRA_AVAILABLE:
         log.error("Cannot perform ASTRA reconstruction: ASTRA Toolbox library not found.")
@@ -189,23 +180,18 @@ def reconstruct_astra(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]
 
     # --- Prepare Full Sinogram Data ---
     log.info("Preparing full sinogram data for ASTRA...")
-    sinogram_id = None # Initialize for cleanup
+    sinogram_id = None
     try:
         sinogram_transposed = np.transpose(sinogram, (1, 0, 2))
         sinogram_astra = np.ascontiguousarray(sinogram_transposed, dtype=np.float32)
-        del sinogram_transposed # Free memory if copy was made
-        gc.collect() # Encourage garbage collection
+        del sinogram_transposed
+        gc.collect()
         log.info(f"Prepared sinogram. Shape: {sinogram_astra.shape}, Dtype: {sinogram_astra.dtype}")
-
-        # Create ASTRA object for the *full* sinogram
         sinogram_id = astra.data3d.create('-sino', proj_geom, sinogram_astra)
         log.info(f"ASTRA sinogram ID created: {sinogram_id}")
-        # We can potentially free the NumPy array now if ASTRA copies it internally
-        # Be cautious with this - test if it causes issues
         del sinogram_astra
         gc.collect()
         log.debug("Released NumPy sinogram reference after passing to ASTRA.")
-
     except Exception as e:
         log.error(f"Error preparing sinogram or creating ASTRA sinogram object: {e}", exc_info=True)
         if sinogram_id is not None: astra.data3d.delete(sinogram_id)
@@ -214,21 +200,34 @@ def reconstruct_astra(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]
     # --- Setup Chunking ---
     full_z, full_y, full_x = cfg.RECON_VOLUME_SHAPE
     chunk_size = getattr(cfg, 'RECON_Z_CHUNK_SIZE', None)
-
-    # Disable chunking if chunk_size is None, 0, or >= full_z
     if chunk_size is None or chunk_size <= 0 or chunk_size >= full_z:
         chunk_size = full_z
-        log.info("Chunking disabled or chunk size covers full volume. Processing as single chunk.")
+        log.info("Chunking disabled or chunk size covers full volume.")
     else:
         chunk_size = int(chunk_size)
         log.info(f"Processing reconstruction in Z-chunks of size: {chunk_size}")
-
-    num_chunks = (full_z + chunk_size - 1) // chunk_size # Ceiling division
+    num_chunks = (full_z + chunk_size - 1) // chunk_size
     log.info(f"Total Z-slices: {full_z}, Number of chunks: {num_chunks}")
 
-    # Pre-allocate final volume in NumPy
     final_reconstructed_volume = np.zeros(cfg.RECON_VOLUME_SHAPE, dtype=np.float32)
     total_recon_time = 0
+
+    # --- Determine Algorithm Name (CPU/GPU) ---
+    # This is done once before the loop
+    algo_name = cfg.RECONSTRUCTION_ALGORITHM.upper()
+    use_gpu_algo = cfg.USE_GPU
+    if use_gpu_algo:
+        try:
+            num_gpus = astra.test_CUDA()
+            if num_gpus <= 0:
+                log.warning("USE_GPU is True, but no CUDA GPUs detected. Falling back to CPU.")
+                use_gpu_algo = False
+        except Exception as e:
+            log.warning(f"Could not query ASTRA for GPU devices: {e}. Assuming GPU available.")
+
+    # Final algorithm string to use
+    algo_string = f'{algo_name}_CUDA' if use_gpu_algo else algo_name
+    log.info(f"Selected ASTRA algorithm string: '{algo_string}' (GPU: {use_gpu_algo})")
 
     # --- Loop Through Chunks ---
     for i in range(num_chunks):
@@ -240,6 +239,7 @@ def reconstruct_astra(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]
         alg_id = None
         recon_id = None
         chunk_vol_geom = None
+        astra_cfg = None # Initialize config dict for the chunk
 
         try:
             # 1. Create Volume Geometry for the *current chunk*
@@ -253,19 +253,20 @@ def reconstruct_astra(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]
             log.debug(f"Created chunk reconstruction data ID: {recon_id}")
 
             # 3. Configure Algorithm for this chunk
-            algo_name = cfg.RECONSTRUCTION_ALGORITHM.upper()
-            use_gpu_algo = cfg.USE_GPU
-            # (GPU check logic - simplified here, assumes check done once outside loop)
-            algo_string = f'{algo_name}_CUDA' if use_gpu_algo else algo_name
-
+            log.debug(f"Configuring algorithm '{algo_string}' for chunk {i+1}...")
             astra_cfg = astra.astra_dict(algo_string)
-            if astra_cfg is None: raise ValueError(f"astra.astra_dict returned None for '{algo_string}'.")
+            # --- Check if astra_cfg was created successfully ---
+            if astra_cfg is None:
+                 # This check might catch issues if the CPU version name is wrong
+                 log.error(f"astra.astra_dict returned None for algorithm '{algo_string}'.")
+                 log.error("Verify the algorithm name is correct and supported for CPU/GPU.")
+                 raise ValueError(f"Algorithm '{algo_string}' configuration failed.")
 
             astra_cfg['ProjectionDataId'] = sinogram_id # Use full sinogram
             astra_cfg['ReconstructionDataId'] = recon_id # Use chunked volume
 
-            # Add algorithm-specific options (same as before)
-            if algo_name == 'FDK': pass # No extra options needed usually
+            # Add algorithm-specific options
+            if algo_name == 'FDK': pass
             elif algo_name in ['SIRT', 'SART', 'CGLS']:
                 astra_cfg['option'] = {}
                 astra_cfg['option']['NumIterations'] = int(cfg.ITERATIVE_NUM_ITERATIONS)
@@ -277,8 +278,19 @@ def reconstruct_astra(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]
             log.debug(f"Algorithm config for chunk {i+1}: {astra_cfg}")
 
             # 4. Create and Run Algorithm for the chunk
+            # --- Add check before creating algorithm ---
+            if not isinstance(astra_cfg, dict) or 'ProjectionDataId' not in astra_cfg or 'ReconstructionDataId' not in astra_cfg:
+                 log.error(f"Invalid astra_cfg dictionary prepared for algorithm creation: {astra_cfg}")
+                 raise ValueError("Algorithm configuration dictionary is invalid.")
+
             alg_id = astra.algorithm.create(astra_cfg)
-            if alg_id is None: raise ValueError("Failed to create algorithm object.")
+            # --- Check if alg_id was created ---
+            if alg_id is None:
+                # This is where the "Unknown algorithm type" likely originates
+                log.error(f"astra.algorithm.create failed for config: {astra_cfg}")
+                log.error(f"Check if algorithm '{algo_string}' is supported by your ASTRA install (esp. CPU version).")
+                raise ValueError(f"Algorithm creation failed for '{algo_string}'.")
+
             log.info(f"Running ASTRA algorithm for chunk {i+1}...")
             chunk_start_time = time.time()
             astra.algorithm.run(alg_id)
@@ -298,38 +310,28 @@ def reconstruct_astra(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]
                  log.debug(f"Stored chunk {i+1} into final volume.")
             else:
                  log.error(f"Shape mismatch for chunk {i+1}! Expected {(current_chunk_z, full_y, full_x)}, got {chunk_data.shape}. Skipping storage.")
-                 # Consider stopping if shape mismatch occurs
 
         except Exception as e:
             log.error(f"Error processing chunk {i+1} (Z={chunk_start_z}-{chunk_end_z-1}): {e}", exc_info=True)
-            # Cleanup sinogram_id and return None if a chunk fails critically
             if sinogram_id is not None: astra.data3d.delete(sinogram_id)
-            # Try to clean up current chunk objects as well
             if alg_id is not None: astra.algorithm.delete(alg_id)
             if recon_id is not None: astra.data3d.delete(recon_id)
             return None # Indicate failure
         finally:
-            # 7. Clean up ASTRA objects for *this chunk* within the loop
+            # 7. Clean up ASTRA objects for *this chunk*
             log.debug(f"Cleaning up ASTRA objects for chunk {i+1}...")
             if alg_id is not None: astra.algorithm.delete(alg_id)
             if recon_id is not None: astra.data3d.delete(recon_id)
-            # We do NOT delete sinogram_id here, only after the loop
-            gc.collect() # Encourage memory release
+            gc.collect()
 
     # --- End of Chunk Loop ---
-
-    # Clean up the full sinogram object *after* all chunks are processed
     log.debug("Cleaning up full sinogram ASTRA object...")
     if sinogram_id is not None: astra.data3d.delete(sinogram_id)
     gc.collect()
-
     log.info(f"Total ASTRA reconstruction time across all chunks: {total_recon_time:.2f} seconds.")
-
-    # Final check on output shape
     if final_reconstructed_volume.shape != cfg.RECON_VOLUME_SHAPE:
-         log.warning(f"Final assembled volume shape {final_reconstructed_volume.shape} differs from config target {cfg.RECON_VOLUME_SHAPE}.")
-
-    return final_reconstructed_volume # Already float32
+         log.warning(f"Final volume shape {final_reconstructed_volume.shape} differs from target {cfg.RECON_VOLUME_SHAPE}.")
+    return final_reconstructed_volume
 
 # reconstruct_tigre remains the same placeholder
 def reconstruct_tigre(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray]:
@@ -365,7 +367,7 @@ def reconstruct_volume(sinogram: np.ndarray, cfg: object) -> Optional[np.ndarray
 
 # Example usage (for testing purposes)
 if __name__ == '__main__':
-    # ... (test script remains similar, will now use chunking if configured) ...
+    # ... (test script remains similar) ...
     import os, imageio.v3 as iio
     print("--- Running Reconstruction Test (with chunking logic) ---")
     config.ensure_output_dirs_exist()
@@ -399,3 +401,4 @@ if __name__ == '__main__':
     else: log.error("Reconstruction test failed.")
     log.info("Reconstruction test script finished.")
     print("--- End of Reconstruction Test ---")
+
