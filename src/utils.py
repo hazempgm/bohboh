@@ -8,6 +8,7 @@ import vtk
 from vtk.util import numpy_support
 import re
 import json
+import configparser
 
 def ensure_directory(directory):
     """
@@ -72,7 +73,75 @@ def read_metadata_file(filepath):
     with open(filepath, 'r') as f:
         content = f.read().strip()
         
-        # Try JSON format first
+        # Check if it's an INI-style file with sections like [GENERAL], [GEOMETRY]
+        if re.search(r'^\[(.*?)\]', content, re.MULTILINE):
+            try:
+                config = configparser.ConfigParser()
+                config.read(filepath)
+                
+                # Convert ConfigParser object to dictionary
+                for section in config.sections():
+                    metadata[section] = {}
+                    for key, value in config[section].items():
+                        # Try to convert value to numeric if possible
+                        try:
+                            if '.' in value:
+                                metadata[section][key] = float(value)
+                            elif value.isdigit():
+                                metadata[section][key] = int(value)
+                            else:
+                                metadata[section][key] = value
+                        except ValueError:
+                            metadata[section][key] = value
+                
+                # Extract key geometry information for easier access
+                if 'GEOMETRY' in metadata:
+                    geom = metadata['GEOMETRY']
+                    metadata['geometry'] = {}
+                    
+                    # Get the distance values
+                    if 'distancesourcedetector' in {k.lower(): v for k, v in geom.items()}:
+                        source_detector_dist = next(v for k, v in geom.items() 
+                                                  if k.lower() == 'distancesourcedetector')
+                        metadata['source_detector_distance'] = source_detector_dist
+                        
+                    if 'distancesourceorigin' in {k.lower(): v for k, v in geom.items()}:
+                        source_origin_dist = next(v for k, v in geom.items() 
+                                                if k.lower() == 'distancesourceorigin')
+                        metadata['source_object_distance'] = source_origin_dist
+                        metadata['geometry']['source_origin_dist'] = source_origin_dist
+                        
+                        # Calculate origin to detector distance
+                        if 'source_detector_distance' in metadata:
+                            origin_detector_dist = metadata['source_detector_distance'] - source_origin_dist
+                            metadata['geometry']['origin_detector_dist'] = origin_detector_dist
+                
+                # Extract acquisition angles
+                if 'ACQUISITION' in metadata:
+                    acq = metadata['ACQUISITION']
+                    if all(k in {k.lower(): v for k, v in acq.items()} for k in 
+                           ['anglefirst', 'angleinterval', 'anglelast']):
+                        first = next(v for k, v in acq.items() if k.lower() == 'anglefirst')
+                        interval = next(v for k, v in acq.items() if k.lower() == 'angleinterval')
+                        last = next(v for k, v in acq.items() if k.lower() == 'anglelast')
+                        
+                        # Generate angles array
+                        metadata['angles'] = np.arange(first, last + interval, interval)
+                
+                # Extract pixel size
+                if 'DETECTOR' in metadata:
+                    det = metadata['DETECTOR']
+                    if 'pixelsize' in {k.lower(): v for k, v in det.items()}:
+                        pixel_size = next(v for k, v in det.items() if k.lower() == 'pixelsize')
+                        metadata['pixel_size'] = pixel_size
+                
+                return metadata
+            except Exception as e:
+                print(f"Error parsing INI file: {e}")
+                # Continue to try other formats
+                pass
+        
+        # Try JSON format
         try:
             metadata = json.loads(content)
             return metadata
@@ -170,6 +239,33 @@ def extract_angles_from_metadata(tiff_files):
     """
     angles = []
     
+    # First check if directory-level metadata has angles information
+    if tiff_files:
+        dir_path = os.path.dirname(tiff_files[0])
+        dir_metadata_files = [
+            os.path.join(dir_path, 'metadata.txt'),
+            os.path.join(dir_path, 'metadata.ini')
+        ]
+        
+        for metadata_file in dir_metadata_files:
+            if os.path.exists(metadata_file):
+                metadata = read_metadata_file(metadata_file)
+                if 'angles' in metadata:
+                    return metadata['angles']
+                elif 'ACQUISITION' in metadata:
+                    acq = metadata['ACQUISITION']
+                    if all(k in {k.lower(): v for k, v in acq.items()} for k in 
+                           ['anglefirst', 'angleinterval', 'anglelast', 'numberimages']):
+                        first = next(v for k, v in acq.items() if k.lower() == 'anglefirst')
+                        interval = next(v for k, v in acq.items() if k.lower() == 'angleinterval')
+                        last = next(v for k, v in acq.items() if k.lower() == 'anglelast')
+                        n_angles = next(v for k, v in acq.items() if k.lower() == 'numberimages')
+                        
+                        # Generate angles array
+                        if isinstance(n_angles, int) and n_angles > 0:
+                            return np.linspace(first, last, n_angles)
+    
+    # If no directory-level metadata with angles, check individual files
     for tiff_file in tiff_files:
         metadata = find_metadata_for_tiff(tiff_file)
         
@@ -236,23 +332,24 @@ def load_projections_with_metadata(directory, pattern="*.tif*", angle_pattern='_
     # Load projection images
     projections, filenames = load_tiff_stack(directory, pattern)
     
-    # Try to get angles from metadata files first
+    # Check for directory-level metadata first
+    metadata = {}
+    for metadata_filename in ['metadata.txt', 'metadata.ini', 'acquisition.txt', 'parameters.txt']:
+        metadata_path = os.path.join(directory, metadata_filename)
+        if os.path.exists(metadata_path):
+            metadata = read_metadata_file(metadata_path)
+            print(f"Found metadata file: {metadata_path}")
+            break
+    
+    # Try to get angles from metadata first
     angles = extract_angles_from_metadata(filenames)
     
     # If all angles are None, try to extract from filenames
     if np.all(angles == None):
         angles = extract_angles_from_filenames(filenames, angle_pattern)
     
-    # Collect additional metadata
-    metadata = {}
-    
-    # Try to get shared metadata from directory-level file
-    dir_metadata_file = os.path.join(directory, 'metadata.txt')
-    if os.path.exists(dir_metadata_file):
-        metadata.update(read_metadata_file(dir_metadata_file))
-    
     # Get geometry information from metadata if available
-    if 'source_detector_distance' in metadata and 'source_object_distance' in metadata:
+    if 'geometry' not in metadata and 'source_detector_distance' in metadata and 'source_object_distance' in metadata:
         source_origin_dist = metadata.get('source_object_distance')
         origin_detector_dist = metadata.get('source_detector_distance') - source_origin_dist
         
