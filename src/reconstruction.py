@@ -1,168 +1,349 @@
-# src/reconstruction.py
+"""
+Reconstruction algorithms for tomographic reconstruction.
+"""
 import numpy as np
-import logging
-from skimage.transform import iradon, radon, rescale # iradon is for reconstruction
-from skimage.data import shepp_logan_phantom # For creating a test phantom
-from typing import Optional
+from scipy import ndimage
+from tqdm import tqdm
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def reconstruct_fbp(
-    sinograms: np.ndarray,
-    angles_rad: np.ndarray,
-    filter_name: str = 'ramp', # Common FBP filter, others: 'shepp-logan', 'cosine', 'hamming', 'hann'
-    output_size: Optional[int] = None
-) -> Optional[np.ndarray]:
+def generate_projector_matrix(geometry, volume_shape):
     """
-    Reconstructs a 3D volume from sinograms using the Filtered Back Projection (FBP) algorithm.
-
-    Reconstructs slice by slice along the height dimension (axis 1).
-
+    Generate a simplified projector matrix for tomographic reconstruction.
+    This is a basic implementation and would be replaced by more efficient
+    methods in a production-ready code.
+    
     Args:
-        sinograms (np.ndarray): The preprocessed projection data (attenuation data).
-                                Expected shape: (num_projections, height, width).
-        angles_rad (np.ndarray): The projection angles in radians. Expected shape: (num_projections,).
-        filter_name (str): The filter to use in FBP ('ramp', 'shepp-logan', etc.).
-        output_size (Optional[int]): The desired size of the output image slices (width and depth).
-                                     If None, it defaults to the width of the sinogram.
-
+        geometry (dict): Projection geometry.
+        volume_shape (tuple): Shape of the volume to reconstruct.
+        
     Returns:
-        Optional[np.ndarray]: The reconstructed 3D volume with shape (height, output_size, output_size),
-                              or None if an error occurs.
+        list: List of projection matrices for each angle.
     """
-    if not isinstance(sinograms, np.ndarray) or sinograms.ndim != 3:
-        logging.error("Invalid sinograms input. Expected a 3D NumPy array.")
-        return None
-    if not isinstance(angles_rad, np.ndarray) or angles_rad.ndim != 1:
-        logging.error("Invalid angles input. Expected a 1D NumPy array.")
-        return None
-    if sinograms.shape[0] != len(angles_rad):
-        logging.error(f"Mismatch between number of projections in sinogram ({sinograms.shape[0]}) "
-                      f"and number of angles ({len(angles_rad)}).")
-        return None
+    # This is a placeholder for a real projector matrix generation
+    # In practice, you would use more sophisticated methods or libraries
+    angles = geometry['angles']
+    projectors = []
+    
+    for angle in angles:
+        # Convert angle to radians
+        theta = np.radians(angle)
+        
+        # Create a simple rotation matrix
+        rot_matrix = np.array([
+            [np.cos(theta), -np.sin(theta), 0],
+            [np.sin(theta), np.cos(theta), 0],
+            [0, 0, 1]
+        ])
+        
+        projectors.append(rot_matrix)
+    
+    return projectors
 
-    num_projections, height, width = sinograms.shape
-    logging.info(f"Starting FBP reconstruction for volume with dimensions: "
-                 f"Projections={num_projections}, Height={height}, Width={width}")
+def filtered_backprojection(projections, angles, volume_shape=None, filter_name='ramp'):
+    """
+    Filtered backprojection algorithm for parallel beam geometry.
+    
+    Args:
+        projections (np.ndarray): Preprocessed projection data (angles, height, width).
+        angles (np.ndarray): Projection angles in degrees.
+        volume_shape (tuple, optional): Shape of the output volume.
+        filter_name (str): Filter to use ('ramp', 'shepp-logan', 'cosine', 'hamming', 'hann').
+    
+    Returns:
+        np.ndarray: Reconstructed 3D volume.
+    """
+    # Convert angles to radians
+    angles_rad = np.radians(angles)
+    
+    if volume_shape is None:
+        size = max(projections.shape[1], projections.shape[2])
+        volume_shape = (size, size, projections.shape[1])
+    
+    # Initialize volume
+    volume = np.zeros(volume_shape, dtype=np.float32)
+    
+    # For each slice along the rotation axis
+    for slice_idx in tqdm(range(projections.shape[1]), desc="FBP Reconstruction"):
+        # Extract sinogram for current slice
+        sinogram = projections[:, slice_idx, :]
+        
+        # Apply filter in frequency domain
+        sinogram_filtered = apply_filter(sinogram, filter_name)
+        
+        # Backproject the filtered sinogram
+        slice_recon = backproject(sinogram_filtered, angles_rad, (volume_shape[0], volume_shape[1]))
+        
+        # Add to volume
+        volume[:, :, slice_idx] = slice_recon
+    
+    return volume
 
-    # Convert angles from radians to degrees for scikit-image's iradon
-    angles_deg = np.rad2deg(angles_rad)
-
-    # Determine output size if not specified
-    if output_size is None:
-        output_size = width
-        logging.info(f"Output size not specified, defaulting to sinogram width: {output_size}")
-
-    # Initialize the 3D volume array
-    # The reconstructed slices will have shape (output_size, output_size)
-    reconstructed_volume = np.zeros((height, output_size, output_size), dtype=np.float32)
-
-    logging.info(f"Reconstructing {height} slices...")
-
-    # Reconstruct slice by slice along the height dimension
-    for i in range(height):
-        # Extract the 2D sinogram for the current slice
-        # Shape needs to be (num_projections, width) for iradon
-        sino_slice = sinograms[:, i, :]
-
-        try:
-            # Perform Filtered Back Projection on the slice
-            # Note: iradon expects theta in degrees
-            recon_slice = iradon(
-                sino_slice,
-                theta=angles_deg,
-                output_size=output_size,
-                filter_name=filter_name,
-                circle=True # Assume the reconstruction region is circular within the square
-            )
-            reconstructed_volume[i, :, :] = recon_slice.astype(np.float32)
-
-            if i % 50 == 0: # Log progress periodically
-                logging.info(f"Reconstructed slice {i+1}/{height}")
-
-        except Exception as e:
-            logging.error(f"Error reconstructing slice {i}: {e}")
-            # Optionally decide whether to continue or abort
-            return None # Abort on error
-
-    logging.info("FBP reconstruction finished.")
-    logging.info(f"Reconstructed volume shape: {reconstructed_volume.shape}")
-    return reconstructed_volume
-
-# Example Usage (can be run directly for testing)
-if __name__ == '__main__':
-    logging.info("Testing reconstruction module...")
-
-    # 1. Create a phantom
-    img_size = 128
-    phantom = shepp_logan_phantom()
-    phantom = rescale(phantom, scale=img_size / 400.0, mode='reflect', channel_axis=None) # Rescale to desired size
-
-    # 2. Create sinogram (Simulate data acquisition using Radon transform)
-    num_projections = 180 # Number of angles/projections
-    angles_deg = np.linspace(0., 180., num_projections, endpoint=False)
-    angles_rad = np.deg2rad(angles_deg)
-
-    # Simulate a 3D sinogram by stacking the 2D sinogram multiple times
-    # (In reality, each slice's sinogram would be different)
-    height = 10 # Simulate a volume height of 10 slices
-    dummy_sinogram_2d = radon(phantom, theta=angles_deg, circle=True) # Shape (num_projections, img_size)
-    # Stack to create a dummy 3D sinogram (projections, height, width)
-    # Note: Need to transpose the 2D sinogram first to match expected input shape
-    dummy_sinograms_3d = np.stack([dummy_sinogram_2d.T] * height, axis=1) # Shape (img_size, height, num_projections) ?? No, radon output is (n_angles, n_detectors)
-    # radon output is (n_detectors, n_angles) if circle=False, but (n_angles, n_detectors) if circle=True? Check docs.
-    # skimage.transform.radon documentation: Output shape is (len(theta), image.shape[1]) -> (num_projections, width)
-    # So dummy_sinogram_2d has shape (num_projections, img_size)
-    # We need (num_projections, height, width) -> width should be img_size
-    dummy_sinograms_3d = np.zeros((num_projections, height, img_size), dtype=np.float32)
-    for i in range(height):
-        # Add slight variation per slice for realism (optional)
-        noise = np.random.normal(0, 0.01 * np.max(dummy_sinogram_2d), dummy_sinogram_2d.shape)
-        dummy_sinograms_3d[:, i, :] = (dummy_sinogram_2d + noise).astype(np.float32)
-
-    logging.info(f"Created dummy sinogram data. Shape: {dummy_sinograms_3d.shape}") # (180, 10, 128)
-    logging.info(f"Using angles (radians). Shape: {angles_rad.shape}") # (180,)
-
-    # --- Test Reconstruction ---
-    logging.info(f"\n--- Testing reconstruct_fbp ---")
-    reconstructed_volume = reconstruct_fbp(
-        dummy_sinograms_3d,
-        angles_rad,
-        output_size=img_size # Reconstruct to original phantom size
-    )
-
-    if reconstructed_volume is not None:
-        logging.info(f"Reconstruction successful. Output volume shape: {reconstructed_volume.shape}")
-        # Basic checks
-        assert reconstructed_volume.shape == (height, img_size, img_size)
-        assert reconstructed_volume.dtype == np.float32
-
-        # Optional: Visualize a slice using matplotlib
-        try:
-            import matplotlib.pyplot as plt
-            middle_slice_index = height // 2
-            plt.figure(figsize=(10, 5))
-            plt.subplot(1, 2, 1)
-            plt.imshow(phantom, cmap='gray')
-            plt.title(f"Original Phantom ({img_size}x{img_size})")
-            plt.axis('off')
-
-            plt.subplot(1, 2, 2)
-            plt.imshow(reconstructed_volume[middle_slice_index, :, :], cmap='gray')
-            plt.title(f"Reconstructed Slice {middle_slice_index} (FBP)")
-            plt.axis('off')
-
-            plt.tight_layout()
-            plt.show()
-            # plt.savefig("reconstruction_test.png") # Optionally save the figure
-            # logging.info("Saved comparison plot to reconstruction_test.png")
-        except ImportError:
-            logging.warning("Matplotlib not found. Skipping visualization.")
-        except Exception as viz_e:
-             logging.error(f"Error during visualization: {viz_e}")
-
+def apply_filter(sinogram, filter_name):
+    """
+    Apply filter to sinogram in frequency domain.
+    
+    Args:
+        sinogram (np.ndarray): Sinogram data.
+        filter_name (str): Name of the filter.
+        
+    Returns:
+        np.ndarray: Filtered sinogram.
+    """
+    # Get dimensions
+    n_angles, n_detector = sinogram.shape
+    
+    # Prepare filter
+    filter_len = max(64, 2**int(np.log2(n_detector) + 1))
+    
+    # Create ramp filter
+    freq = np.fft.fftfreq(filter_len).reshape(-1, 1)
+    omega = 2 * np.pi * freq
+    
+    # Choose filter based on name
+    if filter_name == 'ramp':
+        filt = np.abs(omega)
+    elif filter_name == 'shepp-logan':
+        filt = np.abs(omega) * np.sinc(omega / (2 * np.pi))
+    elif filter_name == 'cosine':
+        filt = np.abs(omega) * np.cos(omega)
+    elif filter_name == 'hamming':
+        filt = np.abs(omega) * (0.54 + 0.46 * np.cos(omega / 2))
+    elif filter_name == 'hann':
+        filt = np.abs(omega) * (0.5 + 0.5 * np.cos(omega / 2))
     else:
-        logging.error("Reconstruction failed.")
+        raise ValueError(f"Unknown filter: {filter_name}")
+    
+    # Zero out the DC component
+    filt[0] = 0
+    
+    # Create filtered sinogram
+    filtered_sinogram = np.zeros_like(sinogram)
+    
+    # Apply filter to each projection
+    for i in range(n_angles):
+        # Pad projection
+        padded_projection = np.zeros(filter_len)
+        padded_projection[:n_detector] = sinogram[i]
+        
+        # FFT
+        projection_fft = np.fft.fft(padded_projection)
+        
+        # Apply filter
+        filtered_projection_fft = projection_fft * filt.ravel()
+        
+        # IFFT and take real part
+        filtered_projection = np.real(np.fft.ifft(filtered_projection_fft))
+        
+        # Crop and store
+        filtered_sinogram[i] = filtered_projection[:n_detector]
+    
+    return filtered_sinogram
 
-    logging.info("\nReconstruction tests finished.")
+def backproject(sinogram, angles, output_shape):
+    """
+    Backproject a filtered sinogram to create a 2D image.
+    
+    Args:
+        sinogram (np.ndarray): Filtered sinogram.
+        angles (np.ndarray): Projection angles in radians.
+        output_shape (tuple): Shape of the output image.
+        
+    Returns:
+        np.ndarray: Backprojected image.
+    """
+    # Create coordinate grid for the output image
+    x = np.arange(output_shape[1]) - output_shape[1] // 2
+    y = np.arange(output_shape[0]) - output_shape[0] // 2
+    X, Y = np.meshgrid(x, y)
+    
+    # Initialize output
+    output = np.zeros(output_shape, dtype=np.float32)
+    
+    # For each angle
+    for i, theta in enumerate(angles):
+        # Calculate detector coordinates for each pixel
+        t = X * np.cos(theta) + Y * np.sin(theta)
+        
+        # Convert to detector pixel coordinates
+        t_idx = np.round(t + sinogram.shape[1] // 2).astype(int)
+        
+        # Apply bounds
+        valid = (t_idx >= 0) & (t_idx < sinogram.shape[1])
+        
+        # Backproject
+        output[valid] += sinogram[i, t_idx[valid]]
+    
+    # Normalize by the number of angles
+    return output * np.pi / len(angles)
+
+def art_reconstruction(projections, angles, volume_shape, iterations=10, relaxation=0.1):
+    """
+    Algebraic Reconstruction Technique (ART).
+    
+    Args:
+        projections (np.ndarray): Preprocessed projection data.
+        angles (np.ndarray): Projection angles in degrees.
+        volume_shape (tuple): Shape of the output volume.
+        iterations (int): Number of iterations.
+        relaxation (float): Relaxation parameter.
+        
+    Returns:
+        np.ndarray: Reconstructed 3D volume.
+    """
+    # Initialize volume
+    volume = np.zeros(volume_shape, dtype=np.float32)
+    
+    # For each slice
+    for slice_idx in tqdm(range(projections.shape[1]), desc="ART Reconstruction"):
+        # Extract sinogram for current slice
+        sinogram = projections[:, slice_idx, :]
+        
+        # Initialize slice
+        recon_slice = np.zeros((volume_shape[0], volume_shape[1]), dtype=np.float32)
+        
+        # ART iterations
+        for _ in range(iterations):
+            for i, angle in enumerate(angles):
+                # Forward projection
+                forward_proj = forward_project(recon_slice, angle)
+                
+                # Compute error
+                error = sinogram[i] - forward_proj
+                
+                # Backproject error and update
+                recon_slice += relaxation * backproject_single(error, angle, (volume_shape[0], volume_shape[1]))
+        
+        # Add to volume
+        volume[:, :, slice_idx] = recon_slice
+    
+    return volume
+
+def forward_project(image, angle_deg):
+    """
+    Forward project an image at given angle.
+    
+    Args:
+        image (np.ndarray): 2D image.
+        angle_deg (float): Projection angle in degrees.
+        
+    Returns:
+        np.ndarray: 1D projection.
+    """
+    # Convert angle to radians
+    angle_rad = np.radians(angle_deg)
+    
+    # Rotate image
+    rotated = ndimage.rotate(image, -angle_deg, reshape=False, order=1)
+    
+    # Sum along columns
+    projection = np.sum(rotated, axis=0)
+    
+    return projection
+
+def backproject_single(projection, angle_deg, output_shape):
+    """
+    Backproject a single projection to create a 2D image.
+    
+    Args:
+        projection (np.ndarray): 1D projection.
+        angle_deg (float): Projection angle in degrees.
+        output_shape (tuple): Shape of the output image.
+        
+    Returns:
+        np.ndarray: Backprojected image.
+    """
+    # Create empty image
+    bp = np.zeros(output_shape, dtype=np.float32)
+    
+    # Fill with projection value
+    for i in range(output_shape[0]):
+        bp[i, :] = projection
+    
+    # Rotate back
+    bp = ndimage.rotate(bp, angle_deg, reshape=False, order=1)
+    
+    return bp
+
+def sirt_reconstruction(projections, angles, volume_shape, iterations=10):
+    """
+    Simultaneous Iterative Reconstruction Technique (SIRT).
+    
+    Args:
+        projections (np.ndarray): Preprocessed projection data.
+        angles (np.ndarray): Projection angles in degrees.
+        volume_shape (tuple): Shape of the output volume.
+        iterations (int): Number of iterations.
+        
+    Returns:
+        np.ndarray: Reconstructed 3D volume.
+    """
+    # Initialize volume
+    volume = np.zeros(volume_shape, dtype=np.float32)
+    
+    # For each slice
+    for slice_idx in tqdm(range(projections.shape[1]), desc="SIRT Reconstruction"):
+        # Extract sinogram for current slice
+        sinogram = projections[:, slice_idx, :]
+        
+        # Initialize slice
+        recon_slice = np.zeros((volume_shape[0], volume_shape[1]), dtype=np.float32)
+        
+        # SIRT iterations
+        for _ in range(iterations):
+            # Initialize correction term
+            correction = np.zeros_like(recon_slice)
+            
+            # For each angle
+            for i, angle in enumerate(angles):
+                # Forward projection
+                forward_proj = forward_project(recon_slice, angle)
+                
+                # Compute error
+                error = sinogram[i] - forward_proj
+                
+                # Backproject error
+                correction += backproject_single(error, angle, (volume_shape[0], volume_shape[1]))
+            
+            # Update slice with average correction
+            recon_slice += correction / len(angles)
+        
+        # Add to volume
+        volume[:, :, slice_idx] = recon_slice
+    
+    return volume
+
+def fdk_reconstruction(projections, geometry, volume_shape):
+    """
+    Feldkamp-Davis-Kress (FDK) algorithm for cone-beam CT.
+    This is a simplified version - a complete implementation would be more complex.
+    
+    Args:
+        projections (np.ndarray): Preprocessed projection data.
+        geometry (dict): Projection geometry.
+        volume_shape (tuple): Shape of the output volume.
+        
+    Returns:
+        np.ndarray: Reconstructed 3D volume.
+    """
+    # Extract parameters
+    angles = geometry['angles']
+    source_origin_dist = geometry['source_origin_dist']
+    
+    # Initialize volume
+    volume = np.zeros(volume_shape, dtype=np.float32)
+    
+    # Weight projections by distance
+    weighted_projections = np.zeros_like(projections)
+    for i in range(projections.shape[0]):
+        # Calculate weighting factor based on cone angle
+        det_center = projections.shape[2] // 2
+        det_pixels = np.arange(projections.shape[2]) - det_center
+        weights = source_origin_dist / np.sqrt(source_origin_dist**2 + det_pixels**2)
+        
+        # Apply weighting
+        for j in range(projections.shape[1]):
+            weighted_projections[i, j, :] = projections[i, j, :] * weights
+    
+    # Apply filtered backprojection with weighted projections
+    volume = filtered_backprojection(weighted_projections, angles, volume_shape)
+    
+    return volume

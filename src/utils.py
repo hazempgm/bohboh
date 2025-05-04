@@ -1,106 +1,348 @@
-# src/utils.py
-import logging
-import sys
-from pathlib import Path
-from typing import Union, Optional
+"""
+Utility functions for tomographic reconstruction.
+"""
+import os
+import numpy as np
+import tifffile
+import vtk
+from vtk.util import numpy_support
+import re
+import json
 
-def setup_logging(
-    level: int = logging.INFO,
-    log_file: Optional[Union[str, Path]] = None,
-    log_format: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    date_format: str = '%Y-%m-%d %H:%M:%S'
-):
+def ensure_directory(directory):
     """
-    Configures the root logger for the project.
-
-    Allows logging to console and optionally to a file. This function should
-    ideally be called once at the start of the main script or application entry point.
-
+    Create directory if it doesn't exist.
+    
     Args:
-        level (int): The minimum logging level (e.g., logging.DEBUG, logging.INFO).
-        log_file (Optional[Union[str, Path]]): Path to the log file. If None, only logs to console.
-        log_format (str): The format string for log messages.
-        date_format (str): The format string for the timestamp in log messages.
+        directory (str): Path to directory.
     """
-    # Get the root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(level) # Set the minimum level for the root logger
+    if not os.path.exists(directory):
+        os.makedirs(directory)
 
-    # Remove existing handlers to avoid duplicate logs if called multiple times
-    # (though ideally it's called only once)
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
+def load_tiff_stack(directory, pattern="*.tif*"):
+    """
+    Load a stack of TIFF images from a directory.
+    
+    Args:
+        directory (str): Directory containing TIFF images.
+        pattern (str): Glob pattern for selecting TIFF files.
+        
+    Returns:
+        tuple: (projections, filenames)
+            projections: 3D array containing all projections.
+            filenames: List of filenames in order they were loaded.
+    """
+    import glob
+    
+    # Get sorted list of TIFF files
+    tiff_files = sorted(glob.glob(os.path.join(directory, pattern)))
+    
+    if not tiff_files:
+        raise ValueError(f"No TIFF files found in {directory} with pattern {pattern}")
+    
+    # Load first image to get dimensions
+    img = tifffile.imread(tiff_files[0])
+    
+    # Allocate array for all projections
+    projections = np.zeros((len(tiff_files), img.shape[0], img.shape[1]), dtype=img.dtype)
+    
+    # Load all projections
+    for i, tiff_file in enumerate(tiff_files):
+        projections[i] = tifffile.imread(tiff_file)
+    
+    return projections, tiff_files
 
-    # Create formatter
-    formatter = logging.Formatter(log_format, datefmt=date_format)
-
-    # Create console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level) # Console handler uses the specified level
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-
-    # Create file handler if log_file is specified
-    if log_file:
+def read_metadata_file(filepath):
+    """
+    Read metadata from a text file.
+    
+    Args:
+        filepath (str): Path to metadata file.
+        
+    Returns:
+        dict: Metadata dictionary.
+    """
+    metadata = {}
+    
+    # Check if file exists
+    if not os.path.exists(filepath):
+        return metadata
+    
+    # Try to determine file format and parse accordingly
+    with open(filepath, 'r') as f:
+        content = f.read().strip()
+        
+        # Try JSON format first
         try:
-            log_file_path = Path(log_file)
-            # Ensure the directory exists
-            log_file_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata = json.loads(content)
+            return metadata
+        except json.JSONDecodeError:
+            pass
+        
+        # Try key-value pairs format (e.g., key=value)
+        try:
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):  # Skip empty lines and comments
+                    continue
+                    
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    # Try to convert value to numeric if possible
+                    try:
+                        if '.' in value:
+                            value = float(value)
+                        else:
+                            value = int(value)
+                    except ValueError:
+                        pass
+                        
+                    metadata[key] = value
+            
+            if metadata:  # If we found some key-value pairs
+                return metadata
+        except Exception:
+            pass
+            
+        # Try to extract values with regular expressions
+        try:
+            # Look for common patterns in metadata files
+            angle_match = re.search(r'angle[s]?\s*[=:]\s*([\d.]+)', content, re.IGNORECASE)
+            if angle_match:
+                metadata['angle'] = float(angle_match.group(1))
+                
+            exposure_match = re.search(r'exposure[_\s]time[s]?\s*[=:]\s*([\d.]+)', content, re.IGNORECASE)
+            if exposure_match:
+                metadata['exposure_time'] = float(exposure_match.group(1))
+                
+            src_det_match = re.search(r'source[_\s]detector[_\s]distance\s*[=:]\s*([\d.]+)', content, re.IGNORECASE)
+            if src_det_match:
+                metadata['source_detector_distance'] = float(src_det_match.group(1))
+                
+            src_obj_match = re.search(r'source[_\s]object[_\s]distance\s*[=:]\s*([\d.]+)', content, re.IGNORECASE)
+            if src_obj_match:
+                metadata['source_object_distance'] = float(src_obj_match.group(1))
+        except Exception:
+            pass
+    
+    return metadata
 
-            file_handler = logging.FileHandler(log_file_path, mode='a') # Append mode
-            file_handler.setLevel(level) # File handler also uses the specified level
-            file_handler.setFormatter(formatter)
-            root_logger.addHandler(file_handler)
-            logging.info(f"Logging configured. Level: {logging.getLevelName(level)}. Outputting to console and file: {log_file_path}")
-        except Exception as e:
-            logging.error(f"Failed to configure file logging to {log_file}: {e}", exc_info=True)
-            # Continue with console logging only
+def find_metadata_for_tiff(tiff_filepath):
+    """
+    Find and read metadata file associated with a TIFF file.
+    
+    Args:
+        tiff_filepath (str): Path to TIFF file.
+        
+    Returns:
+        dict: Metadata dictionary.
+    """
+    base_path = os.path.splitext(tiff_filepath)[0]
+    
+    # Try common metadata file extensions
+    for ext in ['.txt', '.meta', '.metadata', '.json', '.ini']:
+        metadata_path = base_path + ext
+        if os.path.exists(metadata_path):
+            return read_metadata_file(metadata_path)
+    
+    # Try directory-level metadata file
+    dir_path = os.path.dirname(tiff_filepath)
+    for filename in ['metadata.txt', 'metadata.json', 'acquisition.txt', 'parameters.txt']:
+        metadata_path = os.path.join(dir_path, filename)
+        if os.path.exists(metadata_path):
+            return read_metadata_file(metadata_path)
+    
+    # No metadata file found
+    return {}
+
+def extract_angles_from_metadata(tiff_files):
+    """
+    Extract rotation angles from metadata files associated with TIFF files.
+    
+    Args:
+        tiff_files (list): List of TIFF file paths.
+        
+    Returns:
+        np.ndarray: Array of angles in degrees.
+    """
+    angles = []
+    
+    for tiff_file in tiff_files:
+        metadata = find_metadata_for_tiff(tiff_file)
+        
+        if 'angle' in metadata:
+            angles.append(metadata['angle'])
+        else:
+            angles.append(None)
+    
+    # If any angle is None, use evenly spaced angles instead
+    if None in angles:
+        print("Warning: Could not extract angles from all metadata files. Using evenly spaced angles.")
+        angles = np.linspace(0, 360, len(tiff_files), endpoint=False)
     else:
-         logging.info(f"Logging configured. Level: {logging.getLevelName(level)}. Outputting to console only.")
+        angles = np.array(angles)
+        
+    return angles
 
-# You could add other utility functions here as needed, e.g.:
-# def check_path_exists(path: Union[str, Path]): ...
-# def format_time(seconds: float): ...
+def extract_angles_from_filenames(filenames, pattern='_(\d+)deg'):
+    """
+    Extract rotation angles from filenames using regex pattern.
+    
+    Args:
+        filenames (list): List of filenames.
+        pattern (str): Regex pattern to extract angle.
+        
+    Returns:
+        np.ndarray: Array of angles in degrees.
+    """
+    import re
+    
+    angles = []
+    for filename in filenames:
+        match = re.search(pattern, filename)
+        if match:
+            angles.append(float(match.group(1)))
+        else:
+            # If no angle found, use filename index as angle
+            angles.append(None)
+    
+    # If any angle is None, use evenly spaced angles instead
+    if None in angles:
+        print("Warning: Could not extract angles from all filenames. Using evenly spaced angles.")
+        angles = np.linspace(0, 360, len(filenames), endpoint=False)
+    else:
+        angles = np.array(angles)
+        
+    return angles
 
+def load_projections_with_metadata(directory, pattern="*.tif*", angle_pattern='_(\d+)deg'):
+    """
+    Load projections and associated metadata.
+    
+    Args:
+        directory (str): Directory containing projection images.
+        pattern (str): Glob pattern for selecting TIFF files.
+        angle_pattern (str): Regex pattern to extract angle from filenames.
+        
+    Returns:
+        tuple: (projections, angles, metadata)
+            projections: 3D array containing all projections.
+            angles: Array of projection angles in degrees.
+            metadata: Dictionary of additional metadata.
+    """
+    # Load projection images
+    projections, filenames = load_tiff_stack(directory, pattern)
+    
+    # Try to get angles from metadata files first
+    angles = extract_angles_from_metadata(filenames)
+    
+    # If all angles are None, try to extract from filenames
+    if np.all(angles == None):
+        angles = extract_angles_from_filenames(filenames, angle_pattern)
+    
+    # Collect additional metadata
+    metadata = {}
+    
+    # Try to get shared metadata from directory-level file
+    dir_metadata_file = os.path.join(directory, 'metadata.txt')
+    if os.path.exists(dir_metadata_file):
+        metadata.update(read_metadata_file(dir_metadata_file))
+    
+    # Get geometry information from metadata if available
+    if 'source_detector_distance' in metadata and 'source_object_distance' in metadata:
+        source_origin_dist = metadata.get('source_object_distance')
+        origin_detector_dist = metadata.get('source_detector_distance') - source_origin_dist
+        
+        metadata['geometry'] = {
+            'source_origin_dist': source_origin_dist,
+            'origin_detector_dist': origin_detector_dist
+        }
+    
+    return projections, angles, metadata
 
-# Example Usage (can be run directly for testing)
-if __name__ == '__main__':
-    print("--- Testing default logging (should only go to console) ---")
-    # Note: Because logging is configured globally, the basicConfig in other
-    # modules might interfere if they were imported before this setup runs.
-    # In a real application, call setup_logging ONCE near the start.
-    setup_logging(level=logging.DEBUG) # Set level to DEBUG for testing
+def create_projection_geometry(angles, detector_shape, source_origin_dist, origin_detector_dist=None):
+    """
+    Create a dictionary containing the projection geometry.
+    
+    Args:
+        angles (np.ndarray): Array of projection angles in degrees.
+        detector_shape (tuple): Shape of detector (height, width).
+        source_origin_dist (float): Distance from source to rotation center.
+        origin_detector_dist (float, optional): Distance from rotation center to detector.
+            If None, equal to source_origin_dist (symmetric).
+            
+    Returns:
+        dict: Projection geometry parameters.
+    """
+    if origin_detector_dist is None:
+        origin_detector_dist = source_origin_dist
+        
+    return {
+        'angles': angles,
+        'detector_shape': detector_shape,
+        'source_origin_dist': source_origin_dist,
+        'origin_detector_dist': origin_detector_dist,
+        'total_dist': source_origin_dist + origin_detector_dist
+    }
 
-    # Get a logger instance for this specific module test
-    test_logger = logging.getLogger(__name__)
-
-    test_logger.debug("This is a debug message (default setup).")
-    test_logger.info("This is an info message (default setup).")
-    test_logger.warning("This is a warning message (default setup).")
-
-    print("\n--- Testing logging to file ---")
-    log_filename = "test_utils.log"
-    try:
-        # Configure logging to include a file
-        setup_logging(level=logging.INFO, log_file=log_filename)
-
-        test_logger.debug("This debug message should NOT appear (level is INFO).")
-        test_logger.info("This info message should appear in console and file.")
-        test_logger.warning("This warning message should appear in console and file.")
-        test_logger.error("This is an error message.")
-
-        print(f"\nCheck the file '{log_filename}' for log output.")
-
-        # Clean up the test log file afterwards
-        # import os
-        # try:
-        #     os.remove(log_filename)
-        #     print(f"Removed test log file: {log_filename}")
-        # except OSError:
-        #     pass # Ignore if file doesn't exist
-
-    except Exception as e:
-        print(f"An error occurred during file logging test: {e}")
-
-    print("\nUtility tests finished.")
-
+def save_numpy_as_vtk(volume, filename, spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0)):
+    """
+    Save a 3D NumPy array as a VTK file for 3D visualization.
+    
+    Args:
+        volume (np.ndarray): 3D volume data.
+        filename (str): Output filename (.vti extension recommended).
+        spacing (tuple): Voxel spacing in (x, y, z).
+        origin (tuple): Volume origin coordinates.
+    """
+    # Ensure the data is in float32 format
+    if volume.dtype != np.float32:
+        volume = volume.astype(np.float32)
+    
+    # Create VTK image data
+    vtk_data = vtk.vtkImageData()
+    vtk_data.SetDimensions(volume.shape[2], volume.shape[1], volume.shape[0])
+    vtk_data.SetSpacing(spacing)
+    vtk_data.SetOrigin(origin)
+    
+    # Convert NumPy array to VTK array
+    flat_data = volume.ravel(order='F')
+    vtk_array = numpy_support.numpy_to_vtk(flat_data)
+    
+    # Add array to image data
+    vtk_data.GetPointData().SetScalars(vtk_array)
+    
+    # Write VTK file
+    writer = vtk.vtkXMLImageDataWriter()
+    writer.SetFileName(filename)
+    writer.SetInputData(vtk_data)
+    writer.Write()
+    
+def save_volume_as_tiff_stack(volume, output_dir, base_filename="slice"):
+    """
+    Save a 3D volume as a stack of TIFF images.
+    
+    Args:
+        volume (np.ndarray): 3D volume data.
+        output_dir (str): Output directory for TIFF stack.
+        base_filename (str): Base filename for each slice.
+    """
+    ensure_directory(output_dir)
+    
+    # Normalize volume to 0-65535 for 16-bit TIFF
+    if volume.dtype != np.uint16:
+        v_min, v_max = volume.min(), volume.max()
+        if v_min != v_max:  # Avoid division by zero
+            volume_norm = ((volume - v_min) / (v_max - v_min) * 65535).astype(np.uint16)
+        else:
+            volume_norm = np.zeros_like(volume, dtype=np.uint16)
+    else:
+        volume_norm = volume
+    
+    # Save each slice as a TIFF file
+    for i in range(volume.shape[0]):
+        filename = os.path.join(output_dir, f"{base_filename}_{i:04d}.tiff")
+        tifffile.imwrite(filename, volume_norm[i])
