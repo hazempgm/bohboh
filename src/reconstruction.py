@@ -155,22 +155,40 @@ def backproject(sinogram, angles, output_shape):
     y = np.arange(output_shape[0]) - output_shape[0] // 2
     X, Y = np.meshgrid(x, y)
     
+    # Convert to float32 for better performance
+    X = X.astype(np.float32)
+    Y = Y.astype(np.float32)
+    
     # Initialize output
     output = np.zeros(output_shape, dtype=np.float32)
+    detector_center = sinogram.shape[1] // 2
+    detector_size = sinogram.shape[1]
     
     # For each angle
     for i, theta in enumerate(angles):
         # Calculate detector coordinates for each pixel
-        t = X * np.cos(theta) + Y * np.sin(theta)
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
+        t = X * cos_theta + Y * sin_theta
         
         # Convert to detector pixel coordinates
-        t_idx = np.round(t + sinogram.shape[1] // 2).astype(int)
+        t_idx = np.round(t + detector_center).astype(np.int32)
         
-        # Apply bounds
-        valid = (t_idx >= 0) & (t_idx < sinogram.shape[1])
+        # Apply bounds (vectorized)
+        valid = np.logical_and(t_idx >= 0, t_idx < detector_size)
         
-        # Backproject
-        output[valid] += sinogram[i, t_idx[valid]]
+        # Extract valid indices and process in chunks to avoid memory issues
+        y_indices, x_indices = np.where(valid)
+        chunk_size = 1000000  # Process in chunks to avoid memory issues
+        
+        for chunk_start in range(0, len(y_indices), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(y_indices))
+            chunk_y = y_indices[chunk_start:chunk_end]
+            chunk_x = x_indices[chunk_start:chunk_end]
+            chunk_t = t_idx[chunk_y, chunk_x]
+            
+            # Update output directly
+            output[chunk_y, chunk_x] += sinogram[i, chunk_t]
     
     # Normalize by the number of angles
     return output * np.pi / len(angles)
