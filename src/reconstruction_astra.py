@@ -48,26 +48,40 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
         # Extract sinogram for current slice (angles × width)
         sinogram = projections[:, slice_idx, :]
         
-        # ASTRA expects detector columns × angles
-        # Check if we need to transpose based on dimensions
-        if sinogram.shape[0] == len(angles):
-            # If first dimension is angles, transpose to match ASTRA's expected format
+        # ASTRA expects sinogram in format (detectors × angles)
+        # Make sure we're giving it the correct orientation
+        if sinogram.shape[0] == len(angles) and sinogram.shape[1] != len(angles):
+            # This means first dimension is angles, so transpose
             sinogram_astra = sinogram.T
         else:
-            # If already in ASTRA format, use as is
+            # Already in correct format or we can't determine
             sinogram_astra = sinogram
+            
+        # Double-check and force correct orientation
+        if sinogram_astra.shape[1] != len(angles):
+            # If second dimension is not angles, we need to ensure correct orientation
+            # Try the other orientation
+            sinogram_astra = sinogram_astra.T
+            
+        # Final check - if still wrong, raise clear error
+        if sinogram_astra.shape[1] != len(angles):
+            raise ValueError(f"Cannot arrange sinogram to match ASTRA requirements. "
+                           f"Need (detectors, {len(angles)}), got {sinogram_astra.shape}")
             
         # Create ASTRA volume geometry
         vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1])
         
-        # Create ASTRA projection geometry (assuming parallel beam)
+        # Debug info for troubleshooting
+        print(f"Sinogram shape for ASTRA: {sinogram_astra.shape}")
+        print(f"Expected: (detectors, {len(angles)})")
+        
+        # Create ASTRA projection geometry for parallel beam
         proj_geom = astra.create_proj_geom('parallel', 1.0, sinogram_astra.shape[0], angles_rad)
         
         # Debug info for troubleshooting
-        print(f"ASTRA geometry: Detector size={sinogram_astra.shape[0]}, Angles={len(angles_rad)}")
-        print(f"Sinogram shape (expected detector × angles): {sinogram_astra.shape}")
+        print(f"ASTRA geometry: Detector count={sinogram_astra.shape[0]}, Angles={len(angles_rad)}")
         
-        # Create sinogram object
+        # Create sinogram object - ASTRA expects (detectors, angles)
         sino_id = astra.data2d.create('-sino', proj_geom, sinogram_astra)
         
         # Create reconstruction object
