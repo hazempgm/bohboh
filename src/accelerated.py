@@ -74,9 +74,73 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
     Returns:
         np.ndarray: Reconstructed 3D volume.
     """
+    # Set default volume shape if not provided
+    if volume_shape is None:
+        size = projections.shape[2]  # Use width as volume dimension
+        volume_shape = (size, size, projections.shape[1])
+    
+    # Estimate memory requirement
+    required_memory_gb = estimate_required_gpu_memory(volume_shape, projections.shape)
+    
+    # Check if we need to downsample to fit in memory
+    original_projections = projections
+    original_volume_shape = volume_shape
+    downsample_factor = 1
+    
+    # Get available GPU memory if possible
+    available_memory_gb = None
+    if GPU_AVAILABLE:
+        try:
+            import cupy as cp
+            available_memory_gb = cp.cuda.runtime.memGetInfo()[0] / (1024**3)
+            print(f"Available GPU memory: {available_memory_gb:.2f} GB")
+            print(f"Estimated required memory: {required_memory_gb:.2f} GB")
+            
+            # If required memory exceeds 80% of available memory, downsample
+            if required_memory_gb > 0.8 * available_memory_gb:
+                # Calculate downsample factor (power of 2 for best results)
+                memory_ratio = required_memory_gb / (0.7 * available_memory_gb)
+                downsample_factor = 2 ** int(np.ceil(np.log2(np.sqrt(memory_ratio))))
+                print(f"Memory requirement too high. Downsampling by factor {downsample_factor}")
+                
+                # Apply downsampling
+                if downsample_factor > 1:
+                    from skimage.transform import downscale_local_mean
+                    
+                    # Downsample projections
+                    proj_shape = projections.shape
+                    downsampled_projs = np.zeros((
+                        proj_shape[0],
+                        proj_shape[1] // downsample_factor,
+                        proj_shape[2] // downsample_factor
+                    ))
+                    
+                    for i in range(proj_shape[0]):
+                        downsampled_projs[i] = downscale_local_mean(
+                            projections[i],
+                            (downsample_factor, downsample_factor)
+                        )
+                    
+                    projections = downsampled_projs
+                    
+                    # Update volume shape
+                    volume_shape = (
+                        original_volume_shape[0] // downsample_factor,
+                        original_volume_shape[1] // downsample_factor,
+                        original_volume_shape[2] // downsample_factor
+                    )
+                    
+                    print(f"Downsampled projections from {proj_shape} to {projections.shape}")
+                    print(f"Downsampled volume from {original_volume_shape} to {volume_shape}")
+        except Exception as e:
+            print(f"Warning: Could not determine GPU memory. {e}")
+    
     # Determine which implementation to use
     should_use_astra = ASTRA_AVAILABLE if use_astra is None else use_astra
     should_use_gpu = GPU_AVAILABLE if use_gpu is None else use_gpu
+    
+    # Initialize result variable
+    result = None
     
     # Prioritize ASTRA if available (it's usually the fastest)
     if should_use_astra and ASTRA_AVAILABLE:
@@ -86,26 +150,65 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
             astra_filter = filter_name
             if filter_name == 'ramp':
                 astra_filter = 'ram-lak'
-            return filtered_backprojection_astra(projections, angles, volume_shape, astra_filter)
+            result = filtered_backprojection_astra(projections, angles, volume_shape, astra_filter)
         except Exception as e:
             print(f"ASTRA acceleration failed: {e}")
             print("Falling back to GPU/CPU implementation")
             should_use_astra = False
     
     # Try GPU implementation next
-    if should_use_gpu and GPU_AVAILABLE and not should_use_astra:
+    if result is None and should_use_gpu and GPU_AVAILABLE and not should_use_astra:
         try:
             print("Using CuPy GPU-accelerated Filtered Back Projection")
-            return filtered_backprojection_gpu(projections, angles, volume_shape, filter_name)
+            result = filtered_backprojection_gpu(projections, angles, volume_shape, filter_name)
         except Exception as e:
             print(f"GPU acceleration failed: {e}")
             print("Falling back to CPU implementation")
             should_use_gpu = False
     
     # Fall back to CPU implementation
-    if not should_use_gpu and not should_use_astra:
+    if result is None and not should_use_gpu and not should_use_astra:
         print("Using CPU-based Filtered Back Projection")
-        return filtered_backprojection_cpu(projections, angles, volume_shape, filter_name)
+        # For large datasets, we can use chunked processing even on CPU
+        if np.prod(projections.shape) > 1e9:  # More than ~1GB
+            print("Large dataset detected, using chunked processing")
+            from tqdm import tqdm
+            
+            # Initialize empty volume
+            result = np.zeros(volume_shape, dtype=np.float32)
+            
+            # Process in chunks along the detector rows
+            chunk_size = 20  # Process 20 slices at a time
+            for start_idx in tqdm(range(0, projections.shape[1], chunk_size)):
+                end_idx = min(start_idx + chunk_size, projections.shape[1])
+                chunk_projs = projections[:, start_idx:end_idx, :]
+                
+                # Process the chunk
+                chunk_volume = filtered_backprojection_cpu(chunk_projs, angles, 
+                                             (volume_shape[0], volume_shape[1], end_idx-start_idx),
+                                             filter_name)
+                
+                # Insert into final volume
+                result[:, :, start_idx:end_idx] = chunk_volume
+        else:
+            result = filtered_backprojection_cpu(projections, angles, volume_shape, filter_name)
+    
+    # Upsample result if we downsampled earlier
+    if downsample_factor > 1 and result is not None:
+        print(f"Upsampling result back to original size {original_volume_shape}")
+        from scipy.ndimage import zoom
+        
+        # Calculate zoom factor
+        zoom_factor = (
+            original_volume_shape[0] / result.shape[0],
+            original_volume_shape[1] / result.shape[1],
+            original_volume_shape[2] / result.shape[2]
+        )
+        
+        # Upsample
+        result = zoom(result, zoom_factor, order=1)
+    
+    return result
 
 def art_reconstruction(projections, angles, volume_shape, iterations=10, relaxation=0.1, 
                       use_gpu=None, use_astra=None):
