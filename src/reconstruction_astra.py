@@ -47,46 +47,58 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
     # Initialize volume
     volume = np.zeros(volume_shape, dtype=np.float32)
     
+    print(f"ASTRA FBP: Processing {projections.shape[1]} slices with {len(angles)} projection angles")
+    
     # Process slices
     for slice_idx in range(projections.shape[1]):
         # Extract sinogram for this slice
         sino = projections[:, slice_idx, :]
         
+        # Print dimensions for debugging
+        print(f"Sinogram shape: {sino.shape}")
+        det_count = sino.shape[1]
+        print(f"Creating geometry with {det_count} detectors and {len(angles)} angles")
+        
         #----------------------------------------------------------------------
         # ASTRA DIRECT IMPLEMENTATION
         #----------------------------------------------------------------------
-        # Step 1: Create volume geometry
-        vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1])
-        
-        # Step 2: Create sinogram geometry - THIS IS THE KEY!
-        # Note: In ASTRA, detector count is the WIDTH of the detector
-        det_count = sino.shape[1]
-        proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
+        try:
+            # Step 1: Create volume geometry
+            vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1])
             
-        # Step 3: Create a sinogram data object explicitly
-        sino_id = astra.data2d.create('-sino', proj_geom, data=sino.T)
-        
-        # Step 4: Create reconstruction data object
-        vol_id = astra.data2d.create('-vol', vol_geom)
-        
-        # Step 5: Setup FBP algorithm
-        cfg = astra.astra_dict('FBP_CUDA')
-        cfg['ReconstructionDataId'] = vol_id
-        cfg['ProjectionDataId'] = sino_id
-        cfg['FilterType'] = filter_name
-        
-        # Step 6: Run the algorithm
-        alg_id = astra.algorithm.create(cfg)
-        astra.algorithm.run(alg_id)
-        
-        # Step 7: Get result
-        reconstruction = astra.data2d.get(vol_id)
-        volume[:, :, slice_idx] = reconstruction
-        
-        # Step 8: Clean up memory
-        astra.algorithm.delete(alg_id)
-        astra.data2d.delete(vol_id)
-        astra.data2d.delete(sino_id)
+            # Step 2: Create sinogram geometry - THIS IS THE KEY!
+            # Note: In ASTRA, detector count is the WIDTH of the detector
+            proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
+                
+            # Step 3: Create a sinogram data object explicitly
+            # This is the critical part: ASTRA expects sinogram as (detectors, angles)
+            sino_id = astra.data2d.create('-sino', proj_geom, data=sino.T)
+            
+            # Step 4: Create reconstruction data object
+            vol_id = astra.data2d.create('-vol', vol_geom)
+            
+            # Step 5: Setup FBP algorithm
+            cfg = astra.astra_dict('FBP_CUDA')
+            cfg['ReconstructionDataId'] = vol_id
+            cfg['ProjectionDataId'] = sino_id
+            cfg['FilterType'] = filter_name
+            
+            # Step 6: Run the algorithm
+            alg_id = astra.algorithm.create(cfg)
+            astra.algorithm.run(alg_id)
+            
+            # Step 7: Get result
+            reconstruction = astra.data2d.get(vol_id)
+            volume[:, :, slice_idx] = reconstruction
+            
+            # Step 8: Clean up memory
+            astra.algorithm.delete(alg_id)
+            astra.data2d.delete(vol_id)
+            astra.data2d.delete(sino_id)
+            
+        except Exception as e:
+            print(f"ASTRA FBP failed with error: {e}")
+            raise
     
     return volume
 
@@ -121,41 +133,52 @@ def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100)
     # Initialize volume
     volume = np.zeros(volume_shape, dtype=np.float32)
     
+    print(f"ASTRA SIRT: Processing {projections.shape[1]} slices with {len(angles)} projection angles")
+    
     # Process slices
     for slice_idx in range(projections.shape[1]):
         # Extract sinogram for this slice
         sino = projections[:, slice_idx, :]
         
-        # Create volume geometry
-        vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1])
-        
-        # Create sinogram geometry
+        # Print dimensions for debugging
+        print(f"Sinogram shape: {sino.shape}")
         det_count = sino.shape[1]
-        proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
+        print(f"Creating geometry with {det_count} detectors and {len(angles)} angles")
+        
+        try:
+            # Create volume geometry
+            vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1])
             
-        # Create a sinogram data object
-        sino_id = astra.data2d.create('-sino', proj_geom, data=sino.T)
-        
-        # Create reconstruction data object
-        vol_id = astra.data2d.create('-vol', vol_geom)
-        
-        # Setup SIRT algorithm
-        cfg = astra.astra_dict('SIRT_CUDA')
-        cfg['ReconstructionDataId'] = vol_id
-        cfg['ProjectionDataId'] = sino_id
-        
-        # Run the algorithm
-        alg_id = astra.algorithm.create(cfg)
-        astra.algorithm.run(alg_id, iterations)
-        
-        # Get result
-        reconstruction = astra.data2d.get(vol_id)
-        volume[:, :, slice_idx] = reconstruction
-        
-        # Clean up memory
-        astra.algorithm.delete(alg_id)
-        astra.data2d.delete(vol_id)
-        astra.data2d.delete(sino_id)
+            # Create sinogram geometry
+            proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
+                
+            # Create a sinogram data object - transposing to (detectors, angles)
+            sino_id = astra.data2d.create('-sino', proj_geom, data=sino.T)
+            
+            # Create reconstruction data object
+            vol_id = astra.data2d.create('-vol', vol_geom)
+            
+            # Setup SIRT algorithm
+            cfg = astra.astra_dict('SIRT_CUDA')
+            cfg['ReconstructionDataId'] = vol_id
+            cfg['ProjectionDataId'] = sino_id
+            
+            # Run the algorithm
+            alg_id = astra.algorithm.create(cfg)
+            astra.algorithm.run(alg_id, iterations)
+            
+            # Get result
+            reconstruction = astra.data2d.get(vol_id)
+            volume[:, :, slice_idx] = reconstruction
+            
+            # Clean up memory
+            astra.algorithm.delete(alg_id)
+            astra.data2d.delete(vol_id)
+            astra.data2d.delete(sino_id)
+            
+        except Exception as e:
+            print(f"ASTRA SIRT failed with error: {e}")
+            raise
     
     return volume
 
@@ -192,62 +215,70 @@ def fdk_reconstruction_astra(projections, geometry, volume_shape):
     detector_width = projections.shape[2]
     detector_height = projections.shape[1]
     
+    print(f"FDK Geometry: {len(angles_deg)} angles, detector size {detector_width}x{detector_height}")
+    print(f"Source-Origin: {source_origin_dist}mm, Origin-Detector: {origin_detector_dist}mm")
+    
     # Convert to radians
     angles_rad = np.deg2rad(angles_deg)
     
-    # Create 3D volume geometry
-    vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1], volume_shape[2])
-    
-    # Create vectors for cone beam geometry
-    vectors = np.zeros((len(angles_rad), 12))
-    for i, angle in enumerate(angles_rad):
-        # Source position
-        vectors[i, 0] = np.sin(angle) * source_origin_dist  # x
-        vectors[i, 1] = -np.cos(angle) * source_origin_dist  # y
-        vectors[i, 2] = 0  # z
+    try:
+        # Create 3D volume geometry
+        vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1], volume_shape[2])
         
-        # Detector center
-        vectors[i, 3] = -np.sin(angle) * origin_detector_dist  # x
-        vectors[i, 4] = np.cos(angle) * origin_detector_dist  # y
-        vectors[i, 5] = 0  # z
+        # Create vectors for cone beam geometry
+        vectors = np.zeros((len(angles_rad), 12))
+        for i, angle in enumerate(angles_rad):
+            # Source position
+            vectors[i, 0] = np.sin(angle) * source_origin_dist  # x
+            vectors[i, 1] = -np.cos(angle) * source_origin_dist  # y
+            vectors[i, 2] = 0  # z
+            
+            # Detector center
+            vectors[i, 3] = -np.sin(angle) * origin_detector_dist  # x
+            vectors[i, 4] = np.cos(angle) * origin_detector_dist  # y
+            vectors[i, 5] = 0  # z
+            
+            # Detector u direction (columns)
+            vectors[i, 6] = np.cos(angle)  # x
+            vectors[i, 7] = np.sin(angle)  # y
+            vectors[i, 8] = 0  # z
+            
+            # Detector v direction (rows)
+            vectors[i, 9] = 0  # x
+            vectors[i, 10] = 0  # y
+            vectors[i, 11] = 1  # z
         
-        # Detector u direction (columns)
-        vectors[i, 6] = np.cos(angle)  # x
-        vectors[i, 7] = np.sin(angle)  # y
-        vectors[i, 8] = 0  # z
+        # Create projection geometry
+        proj_geom = astra.create_proj_geom('cone_vec', detector_height, detector_width, vectors)
         
-        # Detector v direction (rows)
-        vectors[i, 9] = 0  # x
-        vectors[i, 10] = 0  # y
-        vectors[i, 11] = 1  # z
-    
-    # Create projection geometry
-    proj_geom = astra.create_proj_geom('cone_vec', detector_height, detector_width, vectors)
-    
-    # Create projection data
-    # ASTRA requires dimensions: (detector_rows, projection_count, detector_cols)
-    projs_astra = np.transpose(projections, (1, 0, 2))
-    proj_id = astra.data3d.create('-proj3d', proj_geom, projs_astra)
-    
-    # Create volume data
-    vol_id = astra.data3d.create('-vol', vol_geom)
-    
-    # Setup FDK reconstruction
-    cfg = astra.astra_dict('FDK_CUDA')
-    cfg['ReconstructionDataId'] = vol_id
-    cfg['ProjectionDataId'] = proj_id
-    
-    # Run the algorithm
-    alg_id = astra.algorithm.create(cfg)
-    astra.algorithm.run(alg_id)
-    
-    # Get reconstruction
-    volume = astra.data3d.get(vol_id)
-    
-    # Clean up
-    astra.algorithm.delete(alg_id)
-    astra.data3d.delete(vol_id)
-    astra.data3d.delete(proj_id)
+        # Create projection data
+        # ASTRA requires dimensions: (detector_rows, projection_count, detector_cols)
+        projs_astra = np.transpose(projections, (1, 0, 2))
+        proj_id = astra.data3d.create('-proj3d', proj_geom, projs_astra)
+        
+        # Create volume data
+        vol_id = astra.data3d.create('-vol', vol_geom)
+        
+        # Setup FDK reconstruction
+        cfg = astra.astra_dict('FDK_CUDA')
+        cfg['ReconstructionDataId'] = vol_id
+        cfg['ProjectionDataId'] = proj_id
+        
+        # Run the algorithm
+        alg_id = astra.algorithm.create(cfg)
+        astra.algorithm.run(alg_id)
+        
+        # Get reconstruction
+        volume = astra.data3d.get(vol_id)
+        
+        # Clean up
+        astra.algorithm.delete(alg_id)
+        astra.data3d.delete(vol_id)
+        astra.data3d.delete(proj_id)
+        
+    except Exception as e:
+        print(f"ASTRA FDK failed with error: {e}")
+        raise
     
     return volume
 
