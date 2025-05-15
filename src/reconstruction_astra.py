@@ -58,26 +58,32 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
         # Extract sinogram for current slice - shape: (angles, width)
         sinogram = projections[:, slice_idx, :]
         
-        # No need to transpose - ASTRA handles this with proper vector geometry
-        
         # Create ASTRA volume geometry
         vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1])
         
         # Create projection vectors manually to explicitly control geometry
         det_count = sinogram.shape[1]  # Number of detector pixels (width)
-        
-        # Create a vector-based projection geometry
-        # This is more reliable than the standard parallel geometry
-        proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
+        num_angles = sinogram.shape[0]  # Number of angles
         
         # Log geometry info
         if slice_idx == 0:
-            print(f"ASTRA geometry: {det_count} detector pixels × {len(angles_rad)} angles")
+            print(f"ASTRA geometry: {det_count} detector pixels × {num_angles} angles")
             print(f"Sinogram shape: {sinogram.shape}")
         
-        # Create sinogram object - IMPORTANT: use swapaxes to match ASTRA's expected layout
-        # ASTRA expects (detectors, angles) but our sinogram is (angles, detectors)
-        sino_id = astra.data2d.create('-sino', proj_geom, np.swapaxes(sinogram, 0, 1))
+        # CRITICAL FIX: Create projection geometry correctly
+        # With explicit detector count and number of angles
+        proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
+        
+        # CRITICAL FIX: Don't swap axes! Create sinogram object with correct orientation
+        # First verify orientation by checking sinogram dimensions
+        if sinogram.shape[0] == len(angles_rad) and sinogram.shape[1] == det_count:
+            # We need to transpose for ASTRA - it expects (detector_pixels, angles)
+            # while our data is (angles, detector_pixels)
+            sino_id = astra.data2d.create('-sino', proj_geom, sinogram.T)
+        else:
+            # Something unexpected - better not transpose
+            raise ValueError(f"Unexpected sinogram dimensions: {sinogram.shape}. " +
+                            f"Expected ({len(angles_rad)}, {det_count})")
         
         # Create reconstruction object
         rec_id = astra.data2d.create('-vol', vol_geom)
@@ -149,8 +155,8 @@ def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100)
         det_count = sinogram.shape[1]  # Width
         proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
         
-        # Create sinogram object - with swap to match ASTRA layout
-        sino_id = astra.data2d.create('-sino', proj_geom, np.swapaxes(sinogram, 0, 1))
+        # Create sinogram object - with proper transpose
+        sino_id = astra.data2d.create('-sino', proj_geom, sinogram.T)
         
         # Create reconstruction object
         rec_id = astra.data2d.create('-vol', vol_geom)
