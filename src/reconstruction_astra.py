@@ -71,8 +71,8 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
             proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
                 
             # Step 3: Create a sinogram data object explicitly
-            # This is the critical part: ASTRA expects sinogram as (detectors, angles)
-            sino_id = astra.data2d.create('-sino', proj_geom, data=sino.T)
+            # This is the critical part: ASTRA expects sinogram as (angles, detectors)
+            sino_id = astra.data2d.create('-sino', proj_geom, data=sino)
             
             # Step 4: Create reconstruction data object
             vol_id = astra.data2d.create('-vol', vol_geom)
@@ -152,8 +152,8 @@ def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100)
             # Create sinogram geometry
             proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
                 
-            # Create a sinogram data object - transposing to (detectors, angles)
-            sino_id = astra.data2d.create('-sino', proj_geom, data=sino.T)
+            # Create a sinogram data object - ASTRA expects (angles, detectors)
+            sino_id = astra.data2d.create('-sino', proj_geom, data=sino)
             
             # Create reconstruction data object
             vol_id = astra.data2d.create('-vol', vol_geom)
