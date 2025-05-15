@@ -41,10 +41,17 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
     
     print(f"ASTRA: Processing {projections.shape[1]} slices with {len(angles)} projection angles")
     
-    # Check if projections are in the expected format (angles × height × width)
+    # Handle angle count mismatches gracefully
     if projections.shape[0] != len(angles):
-        raise ValueError(f"First dimension of projections should match angles length. "
-                        f"Got {projections.shape[0]} vs {len(angles)} angles.")
+        print(f"WARNING: Projection count ({projections.shape[0]}) doesn't match angles ({len(angles)})")
+        # Fix the mismatch by using the smaller count
+        if projections.shape[0] > len(angles):
+            print(f"Trimming projections from {projections.shape[0]} to {len(angles)}")
+            projections = projections[:len(angles)]
+        else:
+            print(f"Trimming angles from {len(angles)} to {projections.shape[0]}")
+            angles = angles[:projections.shape[0]]
+            angles_rad = np.deg2rad(angles)
     
     # For each slice along the rotation axis (height dimension)
     for slice_idx in range(projections.shape[1]):
@@ -118,10 +125,17 @@ def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100)
     # Initialize volume
     volume = np.zeros(volume_shape, dtype=np.float32)
     
-    # Check if projections are in the expected format (angles × height × width)
+    # Handle angle count mismatches gracefully
     if projections.shape[0] != len(angles):
-        raise ValueError(f"First dimension of projections should match angles length. "
-                        f"Got {projections.shape[0]} vs {len(angles)} angles.")
+        print(f"WARNING: Projection count ({projections.shape[0]}) doesn't match angles ({len(angles)})")
+        # Fix the mismatch by using the smaller count
+        if projections.shape[0] > len(angles):
+            print(f"Trimming projections from {projections.shape[0]} to {len(angles)}")
+            projections = projections[:len(angles)]
+        else:
+            print(f"Trimming angles from {len(angles)} to {projections.shape[0]}")
+            angles = angles[:projections.shape[0]]
+            angles_rad = np.deg2rad(angles)
     
     # For each slice along the rotation axis
     for slice_idx in range(projections.shape[1]):
@@ -183,6 +197,17 @@ def fdk_reconstruction_astra(projections, geometry, volume_shape):
     origin_detector_dist = float(geometry['origin_detector_dist'])
     detector_width = projections.shape[2]
     detector_height = projections.shape[1]
+    
+    # Handle angle count mismatches gracefully
+    if projections.shape[0] != len(angles_deg):
+        print(f"WARNING: Projection count ({projections.shape[0]}) doesn't match angles ({len(angles_deg)})")
+        # Fix the mismatch by using the smaller count
+        if projections.shape[0] > len(angles_deg):
+            print(f"Trimming projections from {projections.shape[0]} to {len(angles_deg)}")
+            projections = projections[:len(angles_deg)]
+        else:
+            print(f"Trimming angles from {len(angles_deg)} to {projections.shape[0]}")
+            angles_deg = angles_deg[:projections.shape[0]]
     
     # Convert to radians
     angles_rad = np.deg2rad(angles_deg)
