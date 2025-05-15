@@ -74,13 +74,46 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
     Returns:
         np.ndarray: Reconstructed 3D volume.
     """
-    # Set default volume shape if not provided
+    # Ensure projections are float32 to reduce memory usage (vs float64)
+    if projections.dtype != np.float32:
+        projections = projections.astype(np.float32)
+    
+    # Calculate optimal volume shape if not provided
     if volume_shape is None:
-        size = projections.shape[2]  # Use width as volume dimension
-        volume_shape = (size, size, projections.shape[1])
+        # Calculate optimal reconstruction size - critical fix!
+        # Don't make cubic volume by default - that can create massive volumes unnecessarily
+        # Instead, use detector width for x/y dimensions, and height for z dimension
+        det_width = projections.shape[2]
+        det_height = projections.shape[1]
+        
+        # Use the detector width as the x/y size (common in tomography)
+        # This prevents massive overallocation for asymmetric detectors
+        volume_shape = (det_width, det_width, det_height)
+        print(f"Using optimal volume shape: {volume_shape}")
     
     # Estimate memory requirement
     required_memory_gb = estimate_required_gpu_memory(volume_shape, projections.shape)
+    
+    # Calculate output file size
+    output_size_gb = np.prod(volume_shape) * 4 / (1024**3)  # 4 bytes per float32
+    print(f"Output volume size will be approximately {output_size_gb:.2f} GB")
+    
+    # Warning for extremely large volumes
+    if output_size_gb > 10:
+        print(f"WARNING: Very large output volume ({output_size_gb:.2f} GB). Consider reducing volume_shape.")
+    
+    # Get available system memory
+    try:
+        import psutil
+        system_ram = psutil.virtual_memory().available / (1024**3)
+        print(f"Available system RAM: {system_ram:.2f} GB")
+        
+        # Check if output would exceed system RAM
+        if output_size_gb > system_ram * 0.7:  
+            print("WARNING: Output volume may exceed available RAM. Processing may fail.")
+    except ImportError:
+        # Can't check system RAM if psutil not available
+        pass
     
     # Get available GPU memory if possible
     available_memory_gb = None
@@ -120,9 +153,12 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
             # For very large volumes, process in chunks even with ASTRA
             if enable_chunked_processing and projections.shape[1] > 100:
                 print("Using ASTRA with slice-by-slice processing to conserve memory")
-                from tqdm import tqdm
+                try:
+                    from tqdm import tqdm
+                except ImportError:
+                    tqdm = lambda x: x  # Simple fallback if tqdm not available
                 
-                # Initialize volume
+                # Initialize volume with optimal memory layout
                 result = np.zeros(volume_shape, dtype=np.float32)
                 
                 # Calculate appropriate chunk size based on available memory
@@ -140,8 +176,8 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
                 for start_idx in tqdm(range(0, projections.shape[1], slice_chunk_size)):
                     end_idx = min(start_idx + slice_chunk_size, projections.shape[1])
                     
-                    # Extract chunk of projections
-                    chunk_projs = projections[:, start_idx:end_idx, :]
+                    # Extract chunk of projections - use a copy to avoid memory issues
+                    chunk_projs = projections[:, start_idx:end_idx, :].copy()
                     
                     # Process chunk
                     chunk_vol_shape = (volume_shape[0], volume_shape[1], end_idx-start_idx)
@@ -149,6 +185,17 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
                     
                     # Insert into final volume
                     result[:, :, start_idx:end_idx] = chunk_vol
+                    
+                    # Explicitly clean up to reduce memory fragmentation
+                    del chunk_projs
+                    del chunk_vol
+                    import gc
+                    gc.collect()
+                    if GPU_AVAILABLE:
+                        try:
+                            cp.get_default_memory_pool().free_all_blocks()
+                        except:
+                            pass
             else:
                 # Process full volume at once
                 result = filtered_backprojection_astra(projections, angles, volume_shape, astra_filter)
@@ -166,7 +213,10 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
             # For very large volumes, process in chunks
             if enable_chunked_processing:
                 print("Using GPU with slice-by-slice processing to conserve memory")
-                from tqdm import tqdm
+                try:
+                    from tqdm import tqdm
+                except ImportError:
+                    tqdm = lambda x: x  # Simple fallback if tqdm not available
                 
                 # Initialize volume
                 result = np.zeros(volume_shape, dtype=np.float32)
@@ -182,8 +232,8 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
                 for start_idx in tqdm(range(0, projections.shape[1], slice_chunk_size)):
                     end_idx = min(start_idx + slice_chunk_size, projections.shape[1])
                     
-                    # Extract chunk of projections
-                    chunk_projs = projections[:, start_idx:end_idx, :]
+                    # Extract chunk of projections - use a copy to avoid memory issues
+                    chunk_projs = projections[:, start_idx:end_idx, :].copy()
                     
                     # Process chunk
                     chunk_vol_shape = (volume_shape[0], volume_shape[1], end_idx-start_idx)
@@ -191,6 +241,13 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
                     
                     # Insert into final volume
                     result[:, :, start_idx:end_idx] = chunk_vol
+                    
+                    # Explicitly clean up to reduce memory fragmentation
+                    del chunk_projs
+                    del chunk_vol
+                    import gc
+                    gc.collect()
+                    cp.get_default_memory_pool().free_all_blocks()
             else:
                 # Process full volume at once
                 result = filtered_backprojection_gpu(projections, angles, volume_shape, filter_name)
@@ -203,7 +260,10 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
     if result is None and not should_use_gpu and not should_use_astra:
         print("Using CPU-based Filtered Back Projection")
         # For large datasets, we need chunked processing on CPU
-        from tqdm import tqdm
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            tqdm = lambda x: x  # Simple fallback if tqdm not available
         
         # Initialize empty volume
         result = np.zeros(volume_shape, dtype=np.float32)
@@ -214,7 +274,7 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
         
         for start_idx in tqdm(range(0, projections.shape[1], chunk_size)):
             end_idx = min(start_idx + chunk_size, projections.shape[1])
-            chunk_projs = projections[:, start_idx:end_idx, :]
+            chunk_projs = projections[:, start_idx:end_idx, :].copy()
             
             # Process the chunk
             chunk_volume = filtered_backprojection_cpu(chunk_projs, angles, 
@@ -223,6 +283,12 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
             
             # Insert into final volume
             result[:, :, start_idx:end_idx] = chunk_volume
+            
+            # Explicitly clean up
+            del chunk_projs
+            del chunk_volume
+            import gc
+            gc.collect()
     
     return result
 

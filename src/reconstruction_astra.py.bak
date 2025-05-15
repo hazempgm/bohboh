@@ -29,6 +29,10 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
         raise ImportError("ASTRA Toolbox is required for this function. "
                          "Install with: conda install -c astra-toolbox astra-toolbox")
     
+    # Check if projections are too large for memory - raise early warning
+    if np.prod(projections.shape) > 1e9:  # More than ~1GB of projection data
+        print(f"Warning: Large projection data size {projections.shape}. Consider downsampling.")
+    
     # Convert angles to radians
     angles_rad = np.deg2rad(angles)
     
@@ -39,38 +43,47 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
     # Initialize volume
     volume = np.zeros(volume_shape, dtype=np.float32)
     
-    print(f"ASTRA: Processing {projections.shape[1]} slices with {len(angles)} projection angles")
+    print(f"ASTRA: Processing {projections.shape[1]} slices with projection data shape {projections.shape}")
     
-    # Check if projections are in the expected format (angles × height × width)
-    if projections.shape[0] != len(angles):
-        raise ValueError(f"First dimension of projections should match angles length. "
-                        f"Got {projections.shape[0]} vs {len(angles)} angles.")
+    # Determine orientation of the projections (which dimension is angles)
+    angles_dim = None
+    if projections.shape[0] == len(angles):
+        angles_dim = 0
+    else:
+        raise ValueError(f"Could not find angles dimension in projections with shape {projections.shape}")
     
-    # For each slice along the rotation axis (height dimension)
+    # For each slice along the rotation axis
     for slice_idx in range(projections.shape[1]):
-        # Extract sinogram for current slice - shape: (angles, width)
+        # Extract sinogram for current slice
         sinogram = projections[:, slice_idx, :]
-        
-        # No need to transpose - ASTRA handles this with proper vector geometry
         
         # Create ASTRA volume geometry
         vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1])
         
-        # Create projection vectors manually to explicitly control geometry
-        det_count = sinogram.shape[1]  # Number of detector pixels (width)
+        # Create projection vectors manually
+        # This avoids issues with the projection geometry
+        det_count = sinogram.shape[1]  # Number of detector pixels
+        vectors = np.zeros((len(angles_rad), 6))
         
-        # Create a vector-based projection geometry
-        # This is more reliable than the standard parallel geometry
-        proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
+        for i, angle in enumerate(angles_rad):
+            # Ray direction
+            vectors[i, 0] = np.cos(angle)
+            vectors[i, 1] = np.sin(angle)
+            # Center of detector
+            vectors[i, 2] = -np.sin(angle) * det_count/2
+            vectors[i, 3] = np.cos(angle) * det_count/2
+            # Vector from detector pixel 0 to 1
+            vectors[i, 4] = -np.sin(angle)
+            vectors[i, 5] = np.cos(angle)
         
-        # Log geometry info
-        if slice_idx == 0:
-            print(f"ASTRA geometry: {det_count} detector pixels × {len(angles_rad)} angles")
-            print(f"Sinogram shape: {sinogram.shape}")
+        # Create parallel beam projection geometry using vectors
+        proj_geom = astra.create_proj_geom('parallel_vec', det_count, vectors)
         
-        # Create sinogram object - IMPORTANT: use swapaxes to match ASTRA's expected layout
-        # ASTRA expects (detectors, angles) but our sinogram is (angles, detectors)
-        sino_id = astra.data2d.create('-sino', proj_geom, np.swapaxes(sinogram, 0, 1))
+        # Debug info
+        print(f"Slice {slice_idx}: Created projection geometry with {det_count} detectors and {len(angles_rad)} angles")
+        
+        # Create ASTRA sinogram object - no transpose needed with vector geometry
+        sino_id = astra.data2d.create('-sino', proj_geom, sinogram)
         
         # Create reconstruction object
         rec_id = astra.data2d.create('-vol', vol_geom)
@@ -118,34 +131,31 @@ def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100)
     # Initialize volume
     volume = np.zeros(volume_shape, dtype=np.float32)
     
-    # Check if projections are in the expected format (angles × height × width)
-    if projections.shape[0] != len(angles):
-        raise ValueError(f"First dimension of projections should match angles length. "
-                        f"Got {projections.shape[0]} vs {len(angles)} angles.")
-    
     # For each slice along the rotation axis
     for slice_idx in range(projections.shape[1]):
         # Extract sinogram for current slice
         sinogram = projections[:, slice_idx, :]
         
+        # Transpose sinogram to match ASTRA's expected format (detectors × angles)
+        sinogram = sinogram.transpose()
+        
         # Create ASTRA volume geometry
         vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1])
         
-        # Create projection geometry
-        det_count = sinogram.shape[1]  # Width
-        proj_geom = astra.create_proj_geom('parallel', 1.0, det_count, angles_rad)
+        # Create ASTRA projection geometry (assuming parallel beam)
+        proj_geom = astra.create_proj_geom('parallel', 1.0, sinogram.shape[0], angles_rad)
         
-        # Create sinogram object - with swap to match ASTRA layout
-        sino_id = astra.data2d.create('-sino', proj_geom, np.swapaxes(sinogram, 0, 1))
+        # Create sinogram object
+        sino_id = astra.data2d.create('-sino', proj_geom, sinogram)
         
         # Create reconstruction object
         rec_id = astra.data2d.create('-vol', vol_geom)
         
-        # Set up the config for SIRT
+        # Create configuration for SIRT
         cfg = astra.astra_dict('SIRT_CUDA')
         cfg['ReconstructionDataId'] = rec_id
         cfg['ProjectionDataId'] = sino_id
-        cfg['option'] = {'MinConstraint': 0}  # Non-negativity constraint
+        cfg['option'] = {'MinConstraint': 0}  # Enforce non-negativity
         
         # Create and run the algorithm
         alg_id = astra.algorithm.create(cfg)
@@ -190,9 +200,6 @@ def fdk_reconstruction_astra(projections, geometry, volume_shape):
     # Create volume geometry (centered at origin)
     vol_geom = astra.create_vol_geom(volume_shape[0], volume_shape[1], volume_shape[2])
     
-    # Check if projections need to be transposed for ASTRA
-    transposed_projs = np.transpose(projections, (1, 0, 2))
-    
     # Create vectors for cone beam geometry
     vectors = np.zeros((len(angles_rad), 12))
     for i, angle in enumerate(angles_rad):
@@ -220,7 +227,8 @@ def fdk_reconstruction_astra(projections, geometry, volume_shape):
     proj_geom = astra.create_proj_geom('cone_vec', detector_height, detector_width, vectors)
     
     # Create 3D projections data
-    projections_id = astra.data3d.create('-proj3d', proj_geom, transposed_projs)
+    projections_astra = np.transpose(projections, (1, 0, 2))
+    projections_id = astra.data3d.create('-proj3d', proj_geom, projections_astra)
     
     # Create 3D volume data
     volume_id = astra.data3d.create('-vol', vol_geom)
