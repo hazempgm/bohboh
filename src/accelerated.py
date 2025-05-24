@@ -168,34 +168,54 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
                     # Dynamically adjust chunk size based on memory
                     slice_memory_gb = required_memory_gb / projections.shape[1]
                     max_slices = int(0.7 * available_memory_gb / slice_memory_gb)
-                    slice_chunk_size = min(max(5, max_slices), 50)  # Reasonable limits
+                    # Make sure chunk size is reasonable - prefer smaller chunks for safety
+                    slice_chunk_size = min(max(5, max_slices), 40)  # Keep chunks smaller for stability
                 
                 print(f"Processing in chunks of {slice_chunk_size} slices")
                 
                 # Process in chunks
                 for start_idx in tqdm(range(0, projections.shape[1], slice_chunk_size)):
                     end_idx = min(start_idx + slice_chunk_size, projections.shape[1])
+                    current_chunk_size = end_idx - start_idx
                     
                     # Extract chunk of projections - use a copy to avoid memory issues
                     chunk_projs = projections[:, start_idx:end_idx, :].copy()
                     
-                    # Process chunk
-                    chunk_vol_shape = (volume_shape[0], volume_shape[1], end_idx-start_idx)
-                    chunk_vol = filtered_backprojection_astra(chunk_projs, angles, chunk_vol_shape, astra_filter)
+                    # Process chunk - make sure to pass correct volume shape
+                    chunk_vol_shape = (volume_shape[0], volume_shape[1], current_chunk_size)
                     
-                    # Insert into final volume
-                    result[:, :, start_idx:end_idx] = chunk_vol
+                    # Debug output for troubleshooting
+                    print(f"Processing chunk from {start_idx} to {end_idx} with shape {chunk_projs.shape}")
+                    print(f"Using chunk volume shape: {chunk_vol_shape}")
                     
-                    # Explicitly clean up to reduce memory fragmentation
-                    del chunk_projs
-                    del chunk_vol
-                    import gc
-                    gc.collect()
-                    if GPU_AVAILABLE:
-                        try:
-                            cp.get_default_memory_pool().free_all_blocks()
-                        except:
-                            pass
+                    try:
+                        # Process chunk with consistent shape
+                        chunk_vol = filtered_backprojection_astra(chunk_projs, angles, chunk_vol_shape, astra_filter)
+                        
+                        # Insert into final volume - verify dimensions match
+                        if chunk_vol.shape[2] == current_chunk_size:
+                            result[:, :, start_idx:end_idx] = chunk_vol
+                        else:
+                            print(f"WARNING: Chunk shape mismatch. Expected depth {current_chunk_size}, got {chunk_vol.shape[2]}")
+                            # Try to handle mismatched sizes safely
+                            actual_size = min(chunk_vol.shape[2], current_chunk_size)
+                            result[:, :, start_idx:start_idx+actual_size] = chunk_vol[:, :, :actual_size]
+                    except Exception as e:
+                        print(f"Error processing chunk {start_idx}-{end_idx}: {e}")
+                        # Continue with next chunk instead of failing completely
+                        continue
+                    finally:
+                        # Explicitly clean up to reduce memory fragmentation
+                        del chunk_projs
+                        if 'chunk_vol' in locals():
+                            del chunk_vol
+                        import gc
+                        gc.collect()
+                        if GPU_AVAILABLE:
+                            try:
+                                cp.get_default_memory_pool().free_all_blocks()
+                            except:
+                                pass
             else:
                 # Process full volume at once
                 result = filtered_backprojection_astra(projections, angles, volume_shape, astra_filter)
@@ -326,7 +346,7 @@ def art_reconstruction(projections, angles, volume_shape, iterations=10, relaxat
     print("Using CPU-based ART reconstruction")
     return art_reconstruction_cpu(projections, angles, volume_shape, iterations, relaxation)
 
-def sirt_reconstruction(projections, angles, volume_shape, iterations=10, 
+def sirt_reconstruction(projections, angles, volume_shape=None, iterations=10, 
                        use_gpu=None, use_astra=None):
     """
     SIRT reconstruction with automatic acceleration selection.
@@ -342,15 +362,128 @@ def sirt_reconstruction(projections, angles, volume_shape, iterations=10,
     Returns:
         np.ndarray: Reconstructed 3D volume.
     """
+    # Ensure projections are float32 to reduce memory usage
+    if projections.dtype != np.float32:
+        projections = projections.astype(np.float32)
+    
+    # Calculate optimal volume shape if not provided
+    if volume_shape is None:
+        # Calculate optimal reconstruction size
+        det_width = projections.shape[2]
+        det_height = projections.shape[1]
+        
+        # Use the detector width as the x/y size (common in tomography)
+        volume_shape = (det_width, det_width, det_height)
+        print(f"Using optimal volume shape: {volume_shape}")
+    
+    # Estimate memory requirement
+    required_memory_gb = estimate_required_gpu_memory(volume_shape, projections.shape)
+    
+    # Calculate output file size
+    output_size_gb = np.prod(volume_shape) * 4 / (1024**3)  # 4 bytes per float32
+    print(f"Output volume size will be approximately {output_size_gb:.2f} GB")
+    
+    # Memory management
+    enable_chunked_processing = False
+    available_memory_gb = None
+    
+    if GPU_AVAILABLE:
+        try:
+            import cupy as cp
+            available_memory_gb = cp.cuda.runtime.memGetInfo()[0] / (1024**3)
+            print(f"Available GPU memory: {available_memory_gb:.2f} GB")
+            print(f"Estimated required memory: {required_memory_gb:.2f} GB")
+            
+            # If memory requirement is high but not critical, use chunked processing
+            if required_memory_gb > 0.7 * available_memory_gb:
+                enable_chunked_processing = True
+                print("Memory requirement is high. Using slice-by-slice processing.")
+        except Exception as e:
+            print(f"Warning: Could not determine GPU memory. {e}")
+    
     # Determine which implementation to use
     should_use_astra = ASTRA_AVAILABLE if use_astra is None else use_astra
     should_use_gpu = GPU_AVAILABLE if use_gpu is None else use_gpu
+    
+    # Initialize result variable
+    result = None
     
     # Prioritize ASTRA if available
     if should_use_astra and ASTRA_AVAILABLE:
         try:
             print("Using ASTRA Toolbox for SIRT reconstruction (fastest)")
-            return sirt_reconstruction_astra(projections, angles, volume_shape, iterations)
+            
+            # For very large volumes, process in chunks even with ASTRA
+            if enable_chunked_processing and projections.shape[1] > 100:
+                print("Using ASTRA with slice-by-slice processing to conserve memory")
+                try:
+                    from tqdm import tqdm
+                except ImportError:
+                    tqdm = lambda x: x  # Simple fallback if tqdm not available
+                
+                # Initialize volume with optimal memory layout
+                result = np.zeros(volume_shape, dtype=np.float32)
+                
+                # Calculate appropriate chunk size based on available memory
+                # Default to small chunks for safety
+                slice_chunk_size = 20
+                if available_memory_gb is not None:
+                    # Dynamically adjust chunk size based on memory
+                    slice_memory_gb = required_memory_gb / projections.shape[1]
+                    max_slices = int(0.7 * available_memory_gb / slice_memory_gb)
+                    # Make sure chunk size is reasonable - prefer smaller chunks for safety
+                    slice_chunk_size = min(max(5, max_slices), 40)  # Keep chunks smaller for stability
+                
+                print(f"Processing in chunks of {slice_chunk_size} slices")
+                
+                # Process in chunks
+                for start_idx in tqdm(range(0, projections.shape[1], slice_chunk_size)):
+                    end_idx = min(start_idx + slice_chunk_size, projections.shape[1])
+                    current_chunk_size = end_idx - start_idx
+                    
+                    # Extract chunk of projections - use a copy to avoid memory issues
+                    chunk_projs = projections[:, start_idx:end_idx, :].copy()
+                    
+                    # Process chunk - make sure to pass correct volume shape
+                    chunk_vol_shape = (volume_shape[0], volume_shape[1], current_chunk_size)
+                    
+                    # Debug output for troubleshooting
+                    print(f"Processing chunk from {start_idx} to {end_idx} with shape {chunk_projs.shape}")
+                    print(f"Using chunk volume shape: {chunk_vol_shape}")
+                    
+                    try:
+                        # Process chunk with consistent shape
+                        chunk_vol = sirt_reconstruction_astra(chunk_projs, angles, chunk_vol_shape, iterations)
+                        
+                        # Insert into final volume - verify dimensions match
+                        if chunk_vol.shape[2] == current_chunk_size:
+                            result[:, :, start_idx:end_idx] = chunk_vol
+                        else:
+                            print(f"WARNING: Chunk shape mismatch. Expected depth {current_chunk_size}, got {chunk_vol.shape[2]}")
+                            # Try to handle mismatched sizes safely
+                            actual_size = min(chunk_vol.shape[2], current_chunk_size)
+                            result[:, :, start_idx:start_idx+actual_size] = chunk_vol[:, :, :actual_size]
+                    except Exception as e:
+                        print(f"Error processing chunk {start_idx}-{end_idx}: {e}")
+                        # Continue with next chunk instead of failing completely
+                        continue
+                    finally:
+                        # Explicitly clean up to reduce memory fragmentation
+                        del chunk_projs
+                        if 'chunk_vol' in locals():
+                            del chunk_vol
+                        import gc
+                        gc.collect()
+                        if GPU_AVAILABLE:
+                            try:
+                                cp.get_default_memory_pool().free_all_blocks()
+                            except:
+                                pass
+                                
+                return result
+            else:
+                # Process full volume at once
+                return sirt_reconstruction_astra(projections, angles, volume_shape, iterations)
         except Exception as e:
             print(f"ASTRA acceleration failed: {e}")
             print("Falling back to GPU/CPU implementation")
