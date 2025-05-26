@@ -59,7 +59,7 @@ if ASTRA_AVAILABLE:
         ASTRA_AVAILABLE = False
 
 def filtered_backprojection(projections, angles, volume_shape=None, filter_name='ramp', 
-                           use_gpu=None, use_astra=None):
+                           use_gpu=None, use_astra=None, downsample_factor=1):
     """
     Filtered backprojection algorithm with automatic acceleration selection.
     
@@ -190,7 +190,7 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
                     
                     try:
                         # Process chunk with consistent shape
-                        chunk_vol = filtered_backprojection_astra(chunk_projs, angles, chunk_vol_shape, astra_filter)
+                        chunk_vol = filtered_backprojection_astra(chunk_projs, angles, chunk_vol_shape, astra_filter, downsample_factor=downsample_factor)
                         
                         # Insert into final volume - verify dimensions match
                         if chunk_vol.shape[2] == current_chunk_size:
@@ -218,7 +218,7 @@ def filtered_backprojection(projections, angles, volume_shape=None, filter_name=
                                 pass
             else:
                 # Process full volume at once
-                result = filtered_backprojection_astra(projections, angles, volume_shape, astra_filter)
+                result = filtered_backprojection_astra(projections, angles, volume_shape, astra_filter, downsample_factor=downsample_factor)
                 
         except Exception as e:
             print(f"ASTRA acceleration failed: {e}")
@@ -347,7 +347,7 @@ def art_reconstruction(projections, angles, volume_shape, iterations=10, relaxat
     return art_reconstruction_cpu(projections, angles, volume_shape, iterations, relaxation)
 
 def sirt_reconstruction(projections, angles, volume_shape=None, iterations=10, 
-                       use_gpu=None, use_astra=None):
+                       use_gpu=None, use_astra=None, downsample_factor=1):
     """
     SIRT reconstruction with automatic acceleration selection.
     
@@ -453,7 +453,7 @@ def sirt_reconstruction(projections, angles, volume_shape=None, iterations=10,
                     
                     try:
                         # Process chunk with consistent shape
-                        chunk_vol = sirt_reconstruction_astra(chunk_projs, angles, chunk_vol_shape, iterations)
+                        chunk_vol = sirt_reconstruction_astra(chunk_projs, angles, chunk_vol_shape, iterations, downsample_factor=downsample_factor)
                         
                         # Insert into final volume - verify dimensions match
                         if chunk_vol.shape[2] == current_chunk_size:
@@ -483,7 +483,7 @@ def sirt_reconstruction(projections, angles, volume_shape=None, iterations=10,
                 return result
             else:
                 # Process full volume at once
-                return sirt_reconstruction_astra(projections, angles, volume_shape, iterations)
+                return sirt_reconstruction_astra(projections, angles, volume_shape, iterations, downsample_factor=downsample_factor)
         except Exception as e:
             print(f"ASTRA acceleration failed: {e}")
             print("Falling back to GPU/CPU implementation")

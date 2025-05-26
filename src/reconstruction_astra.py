@@ -12,7 +12,7 @@ except ImportError:
     ASTRA_AVAILABLE = False
     print("ASTRA Toolbox not available. Install with 'conda install -c astra-toolbox astra-toolbox'")
 
-def filtered_backprojection_astra(projections, angles, volume_shape=None, filter_name='ram-lak'):
+def filtered_backprojection_astra(projections, angles, volume_shape=None, filter_name='ram-lak', downsample_factor=1):
     """
     ASTRA-based Filtered backprojection algorithm.
     
@@ -36,6 +36,14 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
         count = min(projections.shape[0], len(angles))
         projections = projections[:count]
         angles = angles[:count]
+    
+    # Apply downsampling if requested
+    if downsample_factor > 1:
+        print(f"Downsampling projections by factor {downsample_factor}")
+        # Downsample detector rows/columns - skip pixels
+        projections_ds = projections[:, ::downsample_factor, ::downsample_factor]
+        print(f"Downsampled projection shape: {projections_ds.shape} (original: {projections.shape})")
+        projections = projections_ds
     
     # Convert angles to radians
     angles_rad = np.deg2rad(angles)
@@ -102,7 +110,7 @@ def filtered_backprojection_astra(projections, angles, volume_shape=None, filter
     
     return volume
 
-def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100):
+def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100, downsample_factor=1):
     """
     ASTRA-based SIRT reconstruction algorithm.
     
@@ -126,6 +134,14 @@ def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100)
         count = min(projections.shape[0], len(angles))
         projections = projections[:count]
         angles = angles[:count]
+        
+    # Apply downsampling if requested
+    if downsample_factor > 1:
+        print(f"Downsampling projections by factor {downsample_factor}")
+        # Downsample detector rows/columns - skip pixels
+        projections_ds = projections[:, ::downsample_factor, ::downsample_factor]
+        print(f"Downsampled projection shape: {projections_ds.shape} (original: {projections.shape})")
+        projections = projections_ds
     
     # Convert angles to radians
     angles_rad = np.deg2rad(angles)
@@ -133,10 +149,14 @@ def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100)
     # Initialize volume
     volume = np.zeros(volume_shape, dtype=np.float32)
     
-    print(f"ASTRA SIRT: Processing {projections.shape[1]} slices with {len(angles)} projection angles")
+    # Calculate the number of slices to process (don't exceed volume depth)
+    slices_to_process = min(projections.shape[1], volume_shape[2])
     
-    # Process slices
-    for slice_idx in range(projections.shape[1]):
+    print(f"ASTRA SIRT: Processing {slices_to_process} slices with {len(angles)} projection angles")
+    print(f"Volume shape: {volume_shape}, Projections shape: {projections.shape}")
+    
+    # Process slices - only up to the minimum of projection slices or volume depth
+    for slice_idx in range(slices_to_process):
         # Extract sinogram for this slice
         sino = projections[:, slice_idx, :]
         
@@ -169,7 +189,13 @@ def sirt_reconstruction_astra(projections, angles, volume_shape, iterations=100)
             
             # Get result
             reconstruction = astra.data2d.get(vol_id)
-            volume[:, :, slice_idx] = reconstruction
+            
+            # Make sure we're not accessing out of bounds
+            if slice_idx < volume_shape[2]:
+                volume[:, :, slice_idx] = reconstruction
+            else:
+                print(f"WARNING: Slice index {slice_idx} exceeds volume depth {volume_shape[2]}")
+                break  # Stop processing if we've reached the volume limit
             
             # Clean up memory
             astra.algorithm.delete(alg_id)
