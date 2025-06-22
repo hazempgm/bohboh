@@ -1,5 +1,6 @@
 import numpy as np
 from skimage.transform import iradon
+from skimage.util import img_as_float
 from tqdm import tqdm # A library to show progress bars
 
 def reconstruct_slice(sinogram: np.ndarray, angles: np.ndarray) -> np.ndarray:
@@ -14,9 +15,15 @@ def reconstruct_slice(sinogram: np.ndarray, angles: np.ndarray) -> np.ndarray:
     Returns:
         np.ndarray: The reconstructed 2D slice.
     """
+    # --- CRITICAL PREPROCESSING STEP ---
+    # Convert the sinogram to a float type and normalize values to the [0, 1] range.
+    # This is essential for the stability and correctness of the iradon algorithm,
+    # especially when dealing with high bit-depth data like uint16.
+    sinogram_float = img_as_float(sinogram)
+
     # The scikit-image iradon function expects the sinogram to be (num_detectors, num_angles).
-    # Our data is (num_angles, num_detectors), so we need to transpose it.
-    reconstructed = iradon(sinogram.T, theta=angles, circle=True)
+    # We use our normalized sinogram and transpose it.
+    reconstructed = iradon(sinogram_float.T, theta=angles, circle=True)
     return reconstructed
 
 
@@ -44,6 +51,7 @@ def reconstruct_full_volume(projection_stack: np.ndarray, angles: np.ndarray) ->
         sinogram = projection_stack[:, i, :]
         
         # Reconstruct the slice using the provided angles
+        # The normalization is handled inside reconstruct_slice
         rec_slice = reconstruct_slice(sinogram, angles)
         reconstructed_slices.append(rec_slice)
 
