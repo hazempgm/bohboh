@@ -54,4 +54,5 @@ def reconstruct_full_volume(projection_stack: np.ndarray) -> np.ndarray:
     reconstructed_volume = np.stack(reconstructed_slices, axis=0)
     
     print("Full 3D reconstruction complete.")
+    reconstructed_volume = np.transpose(reconstructed_volume, (1, 2, 0))
     return reconstructed_volume
