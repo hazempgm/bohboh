@@ -7,8 +7,8 @@ import glob
 
 def _parse_metadata(json_path: str) -> Optional[Tuple[List[str], np.ndarray]]:
     """
-    (Internal) Parses the JSON metadata file to extract the ordered list of projection
-    filenames and their corresponding angles.
+    (Internal) Parses the JSON metadata file to extract and SORT the list of
+    projection filenames and their corresponding angles.
     """
     if not os.path.exists(json_path):
         print(f"Error: Metadata file not found at '{json_path}'")
@@ -21,20 +21,39 @@ def _parse_metadata(json_path: str) -> Optional[Tuple[List[str], np.ndarray]]:
     try:
         filenames = metadata['projections']['images']['files']
         angle_data = metadata['geometry']['projectionAngles']
-        angles = [item['angle'] for item in sorted(angle_data, key=lambda x: x['index'])]
+        # Create a list of (angle, index) tuples for sorting
+        angles_with_indices = [(item['angle'], item['index']) for item in angle_data]
     except KeyError as e:
         print(f"Error: Could not find required key in JSON file: {e}")
         return None
 
-    print(f"Found {len(filenames)} filenames and {len(angles)} angles in metadata.")
+    # --- CRITICAL CORRECTION: Sort the data by angle ---
+    # The iradon function requires angles to be in increasing order.
+    # We must sort both the angles and the filenames together to maintain the correct pairs.
     
-    if len(filenames) != len(angles):
-        print("Warning: Mismatch between number of files and angles. Truncating to the smaller count.")
-        min_len = min(len(filenames), len(angles))
-        filenames = filenames[:min_len]
-        angles = angles[:min_len]
+    # 1. Pair each original filename with its angle data.
+    # We assume the initial lists are correctly aligned by their original order.
+    if len(filenames) != len(angles_with_indices):
+        print("Warning: Initial mismatch between number of files and angles. This may cause issues.")
+        # We proceed cautiously, but this indicates a potential data integrity problem.
+        
+    # We use the index from the angle_data to align with the filename list, which is 0-indexed.
+    # The 'index' in the JSON is 1-based, so we subtract 1.
+    try:
+        paired_data = [(angles_with_indices[i][0], filenames[angles_with_indices[i][1] - 1]) for i in range(len(angles_with_indices))]
+    except IndexError:
+        print("Error: Index from metadata is out of bounds for the filenames list. Cannot safely pair data.")
+        return None
 
-    return filenames, np.array(angles)
+    # 2. Sort the pairs based on the angle (the first element of the tuple).
+    sorted_paired_data = sorted(paired_data, key=lambda x: x[0])
+    
+    # 3. Unzip the sorted pairs back into separate lists.
+    sorted_angles, sorted_filenames = zip(*sorted_paired_data)
+    
+    print(f"Data sorted by angle. Found {len(sorted_filenames)} filenames and {len(sorted_angles)} angles.")
+    
+    return list(sorted_filenames), np.array(sorted_angles)
 
 def _load_images_from_list(directory_path: str, file_list: List[str]) -> np.ndarray:
     """(Internal) Loads a specific list of TIFF images from a directory."""
@@ -55,7 +74,7 @@ def load_projection_data(directory_path: str, use_metadata: bool = False) -> Opt
     Loads projection data (images and angles) from a directory.
 
     If use_metadata is True, it tries to find and parse a .json file to get the
-    exact file order and projection angles.
+    exact file order and projection angles, then sorts them by angle.
 
     If use_metadata is False or fails, it loads all tiffs sorted alphabetically
     and generates evenly spaced angles.
