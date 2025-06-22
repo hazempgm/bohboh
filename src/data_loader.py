@@ -1,49 +1,109 @@
 import os
+import json
 import tifffile as tiff
 import numpy as np
-from typing import List
+from typing import List, Tuple, Optional
+import glob
 
-def load_tiff_images(directory_path: str) -> np.ndarray:
+def _parse_metadata(json_path: str) -> Optional[Tuple[List[str], np.ndarray]]:
     """
-    Loads all TIFF images from a specified directory, sorts them by name,
-    and stacks them into a single 3D NumPy array.
-
-    Args:
-        directory_path (str): The path to the directory containing the .tiff files.
-
-    Returns:
-        np.ndarray: A 3D NumPy array containing the stacked images.
-                    Returns an empty array if the directory is not found or contains no .tiff files.
+    (Internal) Parses the JSON metadata file to extract the ordered list of projection
+    filenames and their corresponding angles.
     """
-    if not os.path.isdir(directory_path):
-        print(f"Error: Directory not found at '{directory_path}'")
-        return np.array([])
+    if not os.path.exists(json_path):
+        print(f"Error: Metadata file not found at '{json_path}'")
+        return None
+        
+    print(f"Parsing metadata from: {json_path}")
+    with open(json_path, 'r') as f:
+        metadata = json.load(f)
 
-    image_files: List[str] = sorted([
-        os.path.join(directory_path, f)
-        for f in os.listdir(directory_path)
-        if f.endswith(('.tif', '.tiff'))
-    ])
+    try:
+        filenames = metadata['projections']['images']['files']
+        angle_data = metadata['geometry']['projectionAngles']
+        angles = [item['angle'] for item in sorted(angle_data, key=lambda x: x['index'])]
+    except KeyError as e:
+        print(f"Error: Could not find required key in JSON file: {e}")
+        return None
 
-    if not image_files:
-        print(f"Error: No .tiff files found in '{directory_path}'")
-        return np.array([])
+    print(f"Found {len(filenames)} filenames and {len(angles)} angles in metadata.")
+    
+    if len(filenames) != len(angles):
+        print("Warning: Mismatch between number of files and angles. Truncating to the smaller count.")
+        min_len = min(len(filenames), len(angles))
+        filenames = filenames[:min_len]
+        angles = angles[:min_len]
 
+    return filenames, np.array(angles)
+
+def _load_images_from_list(directory_path: str, file_list: List[str]) -> np.ndarray:
+    """(Internal) Loads a specific list of TIFF images from a directory."""
     images: List[np.ndarray] = []
-    for file_path in image_files:
+    for filename in file_list:
+        file_path = os.path.join(directory_path, filename)
         try:
             image = tiff.imread(file_path)
             images.append(image)
         except Exception as e:
             print(f"Could not read file {file_path}: {e}")
-            continue
     
-    if not images:
-        print("Error: Could not read any of the tiff files successfully.")
-        return np.array([])
+    return np.stack(images, axis=0) if images else np.array([])
 
-    print(f"Successfully loaded {len(images)} images.")
+
+def load_projection_data(directory_path: str, use_metadata: bool = False) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Loads projection data (images and angles) from a directory.
+
+    If use_metadata is True, it tries to find and parse a .json file to get the
+    exact file order and projection angles.
+
+    If use_metadata is False or fails, it loads all tiffs sorted alphabetically
+    and generates evenly spaced angles.
+
+    Args:
+        directory_path (str): Path to the directory with image data.
+        use_metadata (bool): Flag to control whether to use a JSON metadata file.
+
+    Returns:
+        Optional[Tuple[np.ndarray, np.ndarray]]: A tuple of (image_stack, angles), or None on failure.
+    """
+    if use_metadata:
+        print("Attempting to load data using JSON metadata...")
+        json_files = glob.glob(os.path.join(directory_path, '*.json'))
+        if not json_files:
+            print("Error: 'use_metadata' is True, but no .json file was found.")
+            return None
+        
+        metadata_result = _parse_metadata(json_files[0])
+        
+        if metadata_result:
+            filenames, angles = metadata_result
+            image_stack = _load_images_from_list(directory_path, filenames)
+            if image_stack.size > 0:
+                return image_stack, angles
     
-    # Stack images into a single 3D numpy array
-    # The result is a (num_images, height, width) array
-    return np.stack(images, axis=0)
+    # Fallback if use_metadata is False or if it failed
+    if use_metadata:
+        print("Metadata loading failed. Falling back to default method.")
+    
+    print("Loading data without metadata (sorting files alphabetically)...")
+    if not os.path.isdir(directory_path):
+        print(f"Error: Directory not found at '{directory_path}'")
+        return None
+
+    all_files = sorted(glob.glob(os.path.join(directory_path, '*.tif*')))
+    
+    if not all_files:
+        print(f"Error: No .tiff files found in '{directory_path}'")
+        return None
+        
+    image_stack = _load_images_from_list(directory_path, [os.path.basename(f) for f in all_files])
+    
+    if image_stack.size == 0:
+        return None
+        
+    num_projections = image_stack.shape[0]
+    print(f"Generating {num_projections} evenly spaced angles from 0 to 180 degrees.")
+    angles = np.linspace(0., 180., num_projections, endpoint=False)
+    
+    return image_stack, angles
